@@ -1,5 +1,6 @@
 import psycopg2
 import configparser
+import re
 
 def connect_db(config_file='db_config.ini'):
     config = configparser.ConfigParser()
@@ -9,9 +10,19 @@ def connect_db(config_file='db_config.ini'):
 def search_by_keyword(keyword, limit=20):
     conn = connect_db()
     with conn.cursor() as cur:
-        # 处理关键词：按空格拆分，构造 AND 条件
         keywords = keyword.strip().split()
-        conditions = " AND ".join(["all_products ILIKE %s" for _ in keywords])
+        conditions = []
+        params = []
+
+        for kw in keywords:
+            if re.match(r'^CVE-\d{4}-\d+$', kw, re.IGNORECASE):
+                conditions.append("cve_id ILIKE %s")
+                params.append(f"%{kw}%")
+            else:
+                conditions.append("all_products ILIKE %s")
+                params.append(f"%{kw}%")
+
+        where_clause = " AND ".join(conditions)
 
         sql = f"""
             SELECT
@@ -22,14 +33,12 @@ def search_by_keyword(keyword, limit=20):
                 COALESCE(products, '-') AS products,
                 COALESCE(cnnvd_description, cnvd_description, '-') AS description
             FROM merged_vulnerabilities
-            WHERE {conditions}
+            WHERE {where_clause}
             ORDER BY cve_id NULLS LAST
             LIMIT %s;
         """
 
-        # 构造参数列表
-        params = [f"%{k}%" for k in keywords] + [limit]
-
+        params.append(limit)  # 最后添加 limit 参数
         cur.execute(sql, params)
         rows = cur.fetchall()
 
@@ -49,5 +58,5 @@ def search_by_keyword(keyword, limit=20):
 
 # 示例调用
 if __name__ == '__main__':
-    search_by_keyword("Drupal")
+    search_by_keyword("Drupal 4 CVE-2007-3698")
 
