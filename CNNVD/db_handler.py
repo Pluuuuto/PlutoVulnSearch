@@ -4,7 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def connect_db(config_file='config/db_config.ini'):
+def connect_db(config_file='../db_config.ini'):
     config = configparser.ConfigParser()
     config.read(config_file)
     db_params = config['postgresql']
@@ -17,13 +17,14 @@ def create_table_if_not_exists(conn):
             CREATE TABLE IF NOT EXISTS CNNVD (
                 id SERIAL PRIMARY KEY,
                 name TEXT,
-                vuln_id TEXT UNIQUE,  -- ✅ 设置唯一键，支持 ON CONFLICT
+                vuln_id TEXT UNIQUE,
                 published DATE,
                 modified DATE,
                 source TEXT,
                 severity TEXT,
                 vuln_type TEXT,
                 vuln_descript TEXT,
+                products TEXT,
                 cve_id TEXT,
                 bugtraq_id TEXT,
                 vuln_solution TEXT
@@ -42,14 +43,16 @@ def insert_vulnerabilities(conn, vulnerabilities, source_file=None):
                 cur.execute("""
                     INSERT INTO CNNVD (
                         name, vuln_id, published, modified, source, severity,
-                        vuln_type, vuln_descript, cve_id, bugtraq_id, vuln_solution
+                        vuln_type, vuln_descript, products,
+                        cve_id, bugtraq_id, vuln_solution
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (vuln_id) DO NOTHING
                     RETURNING id
                 """, (
                     vuln['name'], vuln['vuln_id'], vuln['published'], vuln['modified'],
                     vuln['source'], vuln['severity'], vuln['vuln_type'], vuln['vuln_descript'],
+                    vuln.get('products', ''),
                     vuln['cve_id'], vuln['bugtraq_id'], vuln['vuln_solution']
                 ))
 

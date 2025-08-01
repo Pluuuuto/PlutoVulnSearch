@@ -5,7 +5,7 @@ import json
 
 logger = logging.getLogger(__name__)
 
-def connect_db(config_file='config/db_config.ini'):
+def connect_db(config_file='../db_config.ini'):
     config = configparser.ConfigParser()
     config.read(config_file)
 
