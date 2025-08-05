@@ -1,11 +1,5 @@
-import psycopg2
-import configparser
 import re
-
-def connect_db(config_file='db_config.ini'):
-    config = configparser.ConfigParser()
-    config.read(config_file)
-    return psycopg2.connect(**config['postgresql'])
+from db import connect_db
 
 def search_by_keyword(keyword, limit=20):
     conn = connect_db()
@@ -38,25 +32,25 @@ def search_by_keyword(keyword, limit=20):
             LIMIT %s;
         """
 
-        params.append(limit)  # 最后添加 limit 参数
+        params.append(limit)
         cur.execute(sql, params)
         rows = cur.fetchall()
 
-        print(f"\n🔍 搜索关键词：{' + '.join(keywords)}")
-        print(f"共匹配到 {len(rows)} 条记录：\n")
-
-        for idx, row in enumerate(rows, start=1):
-            cve, cnvd, name, title, prod, desc = row
-            print(f"{idx}. CVE: {cve or 'N/A'} | CNVD: {cnvd}")
-            print(f"   标题: {title or name}")
-            print(f"   产品: {prod}")
-            clean_desc = (desc or '').replace('\n', ' ').replace('\r', ' ')
-            print(f"   描述: {clean_desc[:100]}...\n")
-
     conn.close()
 
+    result = []
+    for row in rows:
+        cve, cnvd, name, title, prod, desc = row
+        result.append({
+            "cve_id": cve or "N/A",
+            "cnvd_number": cnvd,
+            "title": title or name,
+            "products": prod,
+            "description": desc or ""
+        })
+    return result
 
 # 示例调用
 if __name__ == '__main__':
-    search_by_keyword("Drupal 4 CVE-2007-3698")
+    search_by_keyword("Drupal 4 CVE-2007-3689")
 

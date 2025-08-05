@@ -41,14 +41,3 @@ ON
 
 
 REFRESH MATERIALIZED VIEW merged_vulnerabilities;
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
--- 建在 cnnvd.name 上
-CREATE INDEX idx_cnnvd_name_trgm ON cnnvd USING gin (name gin_trgm_ops);
-
--- 建在 cnnvd.vuln_descript 上
-CREATE INDEX idx_cnnvd_desc_trgm ON cnnvd USING gin (vuln_descript gin_trgm_ops);
-
--- 如果你搜索 CNVD.products，也可以建
-CREATE INDEX idx_cnvd_products_trgm ON cnvd USING gin (products gin_trgm_ops);
