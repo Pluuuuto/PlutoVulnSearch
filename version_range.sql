@@ -2,8 +2,8 @@
 CREATE TABLE IF NOT EXISTS vuln_version_range (
   es_id          TEXT        NOT NULL,      -- 关联 merged_vulnerabilities_view.es_id
   product_id     TEXT        NOT NULL,      -- 规范化产品名(小写)
-  min_code       INT         NOT NULL,      -- 版本编码：a*1e6 + b*1e3 + c
-  max_code       INT         NOT NULL,
+  min_code       BIGINT         NOT NULL,      -- 版本编码：a*1e6 + b*1e3 + c
+  max_code       BIGINT         NOT NULL,
   confidence     REAL        NULL,          -- 0~1
   version_text   TEXT        NULL,          -- 可读展示 "8.0.0-8.6.0; 9.0.0-9.0.10"
   source_text    TEXT        NULL,          -- 原始 products 片段(建议写 merged_vulnerabilities_view.affected_products)
