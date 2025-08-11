@@ -50,3 +50,10 @@ def search_vulns(query_string, index_name="vuln_index", size=10):
     except Exception as e:
         print("查询出错：", e)
         return []
+
+if __name__ == "__main__":
+    # 示例查询
+    query = "tomcat 8.5.0"
+    results = search_vulns(query)
+    for result in results:
+        print(result)
