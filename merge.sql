@@ -1,43 +1,6 @@
-CREATE OR REPLACE VIEW merged_vulnerabilities_view AS
-
--- 第一部分：以 CVE 为主
-SELECT DISTINCT ON (
-    COALESCE(
-        UPPER(cve.cve_id),
-        UPPER(cnvd.cnvd_number),
-        UPPER(cnnvd.vuln_id)
-    )
-)
-    COALESCE(
-        UPPER(cve.cve_id),
-        UPPER(cnvd.cnvd_number),
-        UPPER(cnnvd.vuln_id),
-        md5(COALESCE(cve.vuln_description, '') || COALESCE(cnvd.description, '') || COALESCE(cnnvd.vuln_descript, ''))
-    ) AS es_id,
-    UPPER(cve.cve_id) AS cve_id,
-    cnvd.cnvd_number,
-    cnnvd.vuln_id AS cnnvd_number,
-    CONCAT_WS('; ',
-        NULLIF(cve.vuln_description, ''),
-        NULLIF(cnvd.description, ''),
-        NULLIF(cnnvd.vuln_descript, '')
-    ) AS description,
-    CONCAT_WS(' || ',
-        NULLIF(cve.affected_products, ''),
-        NULLIF(cnvd.products, ''),
-        NULLIF(cnnvd.products, '')
-    ) AS affected_products,
-    CONCAT_WS(' || ',
-        NULLIF(cve.solution, ''),
-        NULLIF(cnvd.patch_description, ''),
-        NULLIF(cnnvd.vuln_solution, '')
-    ) AS solution,
-    COALESCE(cve.cvss_score::TEXT, cnvd.severity, cnnvd.severity) AS risk_display,
-    CASE
-        WHEN cve.cvss_score >= 9.5 THEN 4
-        WHEN cve.cvss_score >= 7.0 THEN 3
-        WHEN cve.cvss_score >= 4.0 THEN 2
-        WHEN cve.cvss_score IS NOT NULL THEN 1
+-- (Deprecated) 视图定义已集中到 db.py 的 MERGED_VIEW_SQL 常量；此文件仅为历史遗留，可删除。
+-- 保留空内容避免误用旧版本。
+-- 若需查看当前视图，请打开 db.py。
         WHEN cnvd.severity = '高' THEN 3
         WHEN cnvd.severity = '中' THEN 2
         WHEN cnvd.severity = '低' THEN 1

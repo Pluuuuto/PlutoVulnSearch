@@ -1,28 +1,7 @@
-from elasticsearch import Elasticsearch
-es = Elasticsearch("http://localhost:9200")
-mapping = {
-  "mappings": {
-    "properties": {
-      "es_id": {
-        "type": "keyword"
-      },
-      "affected_products": {
-        "type": "text",
-        "analyzer": "standard"
-      },
-      "version_ranges": {
-        "type": "nested", 
-        "properties": {
-          "product_id": { "type": "keyword" },
-          "min_code": { "type": "long" },
-          "max_code": { "type": "long" },
-          "confidence": { "type": "float" },
-          "version_text": { "type": "keyword" },
-          "extractor_ver": { "type": "integer" },
-          "updated_at": { "type": "date" }
-        }
-      }
-    }
-  }
-}
-es.indices.create(index="vulnerabilities", body=mapping)
+"""(Deprecated) 保留占位：索引创建逻辑已由 pipeline_daily.ensure_index() 统一管理。
+
+该脚本仅为兼容历史引用而存在，不再执行任何操作，可安全删除。
+"""
+
+if __name__ == "__main__":
+  print("generate_index.py 已弃用：索引由 pipeline_daily.ensure_index() 自动创建。")

@@ -1,43 +1,20 @@
-import psycopg2
-import configparser
 import logging
-import json
+from db import get_conn, ensure_schema
 
 logger = logging.getLogger(__name__)
 
-def connect_db(config_file='../db_config.ini'):
-    config = configparser.ConfigParser()
-    config.read(config_file)
-
-    db_params = config['postgresql']
-    conn = psycopg2.connect(**db_params)
-    return conn
+def connect_db():
+    """返回全局连接。"""
+    return get_conn()
 
 def create_table_if_not_exists(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS CNVD (
-                id SERIAL PRIMARY KEY,
-                cnvd_number TEXT UNIQUE,
-                title TEXT,
-                severity TEXT,
-                products TEXT,
-                cveNumber TEXT,
-                cveUrl TEXT,
-                is_event TEXT,
-                submit_time DATE,
-                open_time DATE,
-                reference_link TEXT,
-                discoverer_name TEXT,
-                formal_way TEXT,
-                description TEXT,
-                patch_name TEXT,
-                patch_description TEXT
-            );
-        """)
-        conn.commit()
+    """兼容旧接口：内部调用 ensure_schema()。"""
+    ensure_schema()
 
 def insert_vulnerabilities(conn, vulnerabilities, source_file=None):
+    """批量插入 CNVD 记录。
+
+    同步返回成功/跳过/失败明细。"""
     success_count = 0
     skipped_logs = []
     failed_logs = []

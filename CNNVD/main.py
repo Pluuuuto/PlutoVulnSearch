@@ -1,7 +1,12 @@
-import os
+import os, sys, pathlib
 import logging
 from parser import parse_vulnerabilities
 from db_handler import connect_db, insert_vulnerabilities, create_table_if_not_exists
+from db import ensure_schema
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 # 日志配置
 os.makedirs('log', exist_ok=True)
@@ -17,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    data_dir = 'test'  # 你的 XML 文件目录
+    data_dir = 'data'  # 你的 XML 文件目录
     xml_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.xml')]
     xml_files.sort()
 
@@ -25,8 +30,8 @@ def main():
     all_failed_logs = []
     all_skipped_logs = []
 
+    ensure_schema()
     conn = connect_db()
-    create_table_if_not_exists(conn)
 
     for xml_file in xml_files:
         xml_path = os.path.join(data_dir, xml_file)

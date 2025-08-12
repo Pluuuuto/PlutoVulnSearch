@@ -1,33 +1,23 @@
-import psycopg2
-import configparser
 import logging
+from db import get_conn, ensure_schema  # unified schema / connection
 
 logger = logging.getLogger(__name__)
 
-def connect_db(config_file='../db_config.ini'):
-    config = configparser.ConfigParser()
-    config.read(config_file)
+def connect_db():  # backward compatible name
+    """返回全局连接（兼容旧调用）。"""
+    return get_conn()
 
-    db_params = config['postgresql']
-    conn = psycopg2.connect(**db_params)
-    return conn
-
-def create_table_if_not_exists(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS CVE (
-                id SERIAL PRIMARY KEY,
-                cve_id TEXT UNIQUE,
-                published_date DATE,
-                affected_products TEXT,
-                solution TEXT,
-                cvss_score NUMERIC(3,1),
-                vuln_description TEXT
-            );
-        """)
-        conn.commit()
+def create_table_if_not_exists(conn):  # kept for compatibility, now delegates
+    """兼容旧接口：内部调用 ensure_schema()。"""
+    ensure_schema()
 
 def insert_vulnerabilities(conn, vulnerabilities, source_file=None):
+    """批量插入 CVE 记录（逐条执行）。
+
+    返回: (success_count, skipped_logs, failed_logs)
+    说明:
+      - ON CONFLICT DO NOTHING 保障幂等。
+      - 每条提交（可后续优化批量事务）。"""
     success_count = 0
     skipped_logs = []
     failed_logs = []
