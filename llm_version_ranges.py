@@ -1,21 +1,23 @@
-import logging
-import os, json, hashlib, psycopg2
+# llm_version_ranges_mt.py
+# 多线程版本：读取待处理列表 → 并发调用 Qwen → 写入 vuln_version_range
+import os, json, hashlib, logging, traceback, time
+import psycopg2
 import psycopg2.extras as pg_extras
-from typing import List, Tuple, Dict, Any
-from dashscope import Generation
-import traceback
+import psycopg2.pool as pg_pool
+import requests
 from datetime import datetime
+from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import BoundedSemaphore
 
 # ====================== 日志配置 ======================
 LOG_FILE = f"log/llm_version_ranges_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-# 控制台日志（简洁）
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
 console_handler.setFormatter(console_formatter)
 
-# 文件日志（详细）
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -26,14 +28,22 @@ logger = logging.getLogger(__name__)
 
 # ====================== 基础配置 ======================
 PG_DSN = os.getenv("PG_DSN", "host=localhost port=5432 dbname=vul user=test password=test")
-BATCH = int(os.getenv("BATCH", "500"))
+BATCH = int(os.getenv("BATCH", "1000"))  # 全量时每次抓取多少候选
 EXTRACTOR_VER = int(os.getenv("EXTRACTOR_VER", "1"))
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-turbo")
 
-# 测试模式参数
-TEST_MODE = False
-TEST_LIMIT = 20
+# 私有 Qwen 接口
+COMPLETION_URL = os.getenv("QWEN_COMPLETION_URL",
+                           "http://192.168.85.121:30402/service/c0ae9380ad9609aef1dc678142b38258")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen")
+
+# 多线程
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))             # 线程数
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))     # 同时进行的 LLM 调用数上限（可小于 MAX_WORKERS）
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))  # 单次 LLM 请求超时秒
+
+# 模式
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1","true","yes","y")
+TEST_LIMIT = int(os.getenv("TEST_LIMIT", "20"))
 
 # ====================== 版本解析与区间处理 ======================
 def parse_semver(s: str) -> Tuple[int,int,int,int]:
@@ -112,8 +122,7 @@ def items_to_intervals(items: List[Dict[str, Any]]) -> List[Tuple[int,int,str,st
             else:
                 lower_bound, lower_str, lower_inclusive = base_code, vs[0], True
         elif typ == "range" and len(vs) >= 2:
-            start = code_from_str(vs[0])
-            end = code_from_str(vs[1])
+            start = code_from_str(vs[0]); end = code_from_str(vs[1])
             if start > end:
                 start, end = end, start
                 vs[0], vs[1] = vs[1], vs[0]
@@ -149,7 +158,7 @@ def interval_to_text(iv: List[Tuple[int,int,str,str,bool,bool]]) -> str:
             parts.append(f"{left} & {right}")
     return "; ".join(parts)
 
-# ====================== LLM 调用 ======================
+# ====================== LLM 调用（私有 Qwen） ======================
 LLM_SYSTEM = """你是“产品版本条件抽取器”。只输出 JSON，不要任何解释。
 输出格式（严格遵守，字段名固定）：
 {
@@ -181,36 +190,47 @@ def _extract_json_str(s: str) -> str:
         return s[i:j+1]
     return s
 
+session = requests.Session()
+llm_sem = BoundedSemaphore(LLM_CONCURRENCY)
+
 def call_llm(text: str) -> Dict[str, Any]:
-    if not DASHSCOPE_API_KEY:
-        raise RuntimeError("缺少 DASHSCOPE_API_KEY 环境变量")
-    messages = [
-        {"role": "system", "content": LLM_SYSTEM},
-        {"role": "user", "content": text}
-    ]
-    resp = Generation.call(model=QWEN_MODEL, messages=messages, temperature=0.1)
-    logger.debug(f"LLM 原始响应: {resp}")
-
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": [
+            {"role": "system", "content": LLM_SYSTEM},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.1
+    }
+    with llm_sem:
+        resp = session.post(COMPLETION_URL, json=payload, timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
-        raise RuntimeError(f"Qwen API error: {resp.status_code} - {getattr(resp, 'message', '')}")
+        raise RuntimeError(f"Qwen API error: {resp.status_code} - {resp.text}")
 
-    if hasattr(resp, "output") and getattr(resp.output, "text", None):
-        content = resp.output.text
-    elif hasattr(resp, "output") and getattr(resp.output, "choices", None):
-        content = resp.output.choices[0]["message"]["content"]
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Qwen API 返回不是 JSON: {e} - {resp.text}")
+
+    # 兼容常见两种结构
+    if isinstance(data, dict) and "choices" in data and data["choices"]:
+        content = data["choices"][0]["message"]["content"]
+    elif isinstance(data, dict) and "output" in data and isinstance(data["output"], dict) and "text" in data["output"]:
+        content = data["output"]["text"]
     else:
-        raise RuntimeError(f"Qwen API 返回格式不符合预期: {resp}")
+        raise RuntimeError(f"Qwen API 返回格式不符合预期: {data}")
 
     jtxt = _extract_json_str(content)
     return json.loads(jtxt)
 
-# ====================== 数据库写入 ======================
+# ====================== 数据库工具 ======================
 def md5(s: str) -> str:
     return hashlib.md5((s or "").encode("utf-8")).hexdigest()
 
 def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]):
     raw_hash = md5(src_text)
     with conn.cursor() as cur:
+        # 如无 DELETE 权限可去掉本句，但可能导致旧区间残留
         cur.execute("DELETE FROM vuln_version_range WHERE es_id=%s", (es_id,))
         for p in products or []:
             pid = (p.get("product_id") or "unknown").strip().lower()
@@ -233,73 +253,113 @@ def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]
                                 updated_at=now()
                 """, (es_id, pid, lo, hi, conf, vtext, src_text, raw_hash, EXTRACTOR_VER))
 
-# ====================== 主流程 ======================
-def main():
-    conn_read = psycopg2.connect(PG_DSN)   # 读连接
-    conn_write = psycopg2.connect(PG_DSN)  # 写连接
-
-    if TEST_MODE:
-        cur = conn_read.cursor(cursor_factory=pg_extras.RealDictCursor)
-        cur.execute(f"""
-            SELECT es_id, affected_products
-            FROM merged_vulnerabilities_view
-            ORDER BY random()
-            LIMIT {TEST_LIMIT}
-        """)
-        rows = cur.fetchall()
-    else:
-        cur = conn_read.cursor(name="mv_llm_cursor", cursor_factory=pg_extras.RealDictCursor)
-        cur.itersize = BATCH
-        cur.execute("SELECT es_id, affected_products FROM merged_vulnerabilities_view")
-        rows = cur
-
-    processed = 0
-    for row in rows:
-        es_id = row["es_id"]
-        text = row["affected_products"] or ""
-
-        logger.info(f"[{processed+1}] 处理 es_id: {es_id}")
-
-        with conn_write.cursor() as c2:
+# ====================== 工作线程 ======================
+def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str, Any]:
+    """处理单条：去重检查 → 调 LLM → 写库。返回结果字典用于统计。"""
+    es_id = task["es_id"]; text = task["affected_products"] or ""
+    conn = None
+    try:
+        conn = pool.getconn()
+        # 去重（断点续跑）
+        with conn.cursor() as c2:
             c2.execute("""
               SELECT 1 FROM vuln_version_range
                WHERE es_id=%s AND extractor_ver >= %s
                LIMIT 1
             """, (es_id, EXTRACTOR_VER))
             if c2.fetchone():
-                logger.debug(f"跳过已处理 es_id: {es_id}")
-                continue
+                return {"es_id": es_id, "skipped": True}
 
-        try:
-            result = call_llm(text)
-            logger.debug(f"LLM 解析结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
-            products = result.get("products") or []
-        except Exception as e:
-            logger.error(f"LLM 调用失败 - es_id: {es_id} - {e}")
-            logger.debug(traceback.format_exc())
-            products = []
+        # 调 LLM
+        result = call_llm(text)
+        products = result.get("products") or []
 
+        # 写库
         if products:
-            try:
-                upsert_ranges(conn_write, es_id, text, products)
-                conn_write.commit()
-                logger.debug(f"写入完成: {es_id}")
-            except Exception as e:
-                logger.error(f"写入数据库失败 - es_id: {es_id} - {e}")
-                logger.debug(traceback.format_exc())
-                conn_write.rollback()
+            upsert_ranges(conn, es_id, text, products)
+            conn.commit()
+            return {"es_id": es_id, "inserted": True, "count": len(products)}
         else:
-            logger.warning(f"未提取到产品信息 - es_id: {es_id}")
+            # 无抽取也记个空结果的 info（不写库）
+            return {"es_id": es_id, "empty": True}
+    except Exception as e:
+        if conn:
+            try: conn.rollback()
+            except: pass
+        logger.error(f"处理失败 es_id={es_id} - {e}")
+        logger.debug(traceback.format_exc())
+        return {"es_id": es_id, "error": str(e)}
+    finally:
+        if conn:
+            pool.putconn(conn)
 
-        processed += 1
-        if TEST_MODE and processed >= TEST_LIMIT:
-            logger.info(f"测试模式：已处理 {TEST_LIMIT} 条，提前结束。")
-            break
+# ====================== 主流程 ======================
+def main():
+    # 连接池（读写一个池即可；每线程取独立连接）
+    minc = max(2, min(4, MAX_WORKERS//2))
+    maxc = max(MAX_WORKERS*2, 8)
+    pool = psycopg2.pool.SimpleConnectionPool(minc, maxc, PG_DSN)
 
-    cur.close()
-    conn_read.close()
-    conn_write.close()
-    logger.info(f"done. total scanned: {processed}")
+    # 预取待处理列表（避免服务端游标被并发写操作干掉）
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
+            if TEST_MODE:
+                cur.execute(f"""
+                    SELECT es_id, affected_products
+                    FROM merged_vulnerabilities_view
+                    ORDER BY random()
+                    LIMIT {TEST_LIMIT}
+                """)
+            else:
+                # 全量：优先只取“未处理”的，减少无用调用
+                cur.execute("""
+                    SELECT mv.es_id, mv.affected_products
+                    FROM merged_vulnerabilities_view mv
+                    LEFT JOIN (
+                        SELECT DISTINCT es_id FROM vuln_version_range WHERE extractor_ver >= %s
+                    ) v ON mv.es_id = v.es_id
+                    WHERE v.es_id IS NULL
+                    LIMIT %s
+                """, (EXTRACTOR_VER, BATCH))
+            tasks = cur.fetchall()
+    finally:
+        pool.putconn(conn)
+
+    if not tasks:
+        logger.info("没有需要处理的数据。")
+        return
+
+    logger.info(f"本批待处理: {len(tasks)} 条，线程: {MAX_WORKERS}，LLM并发: {LLM_CONCURRENCY}")
+
+    ok, skip, empty, err = 0, 0, 0, 0
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        future_map = {ex.submit(worker, t, pool): t for t in tasks}
+        for fut in as_completed(future_map):
+            res = fut.result()
+            es_id = res.get("es_id")
+            if res.get("inserted"):
+                ok += 1
+                logger.info(f"✅ 写入完成 {es_id}（products={res.get('count')})")
+            elif res.get("skipped"):
+                skip += 1
+                logger.debug(f"跳过已处理 {es_id}")
+            elif res.get("empty"):
+                empty += 1
+                logger.info(f"⚠️ 无抽取结果 {es_id}")
+            else:
+                err += 1
+                logger.error(f"❌ 失败 {es_id}: {res.get('error')}")
+
+    elapsed = time.time() - started
+    logger.info(f"批次完成: 写入 {ok} 条, 跳过 {skip} 条, 无结果 {empty} 条, 失败 {err} 条，用时 {elapsed:.1f}s")
+
+    # 连接池关闭
+    try:
+        pool.closeall()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
