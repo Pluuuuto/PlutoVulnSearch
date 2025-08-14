@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def run():
     # 数据目录位于当前模块同级: CVE/data
-    data_dir = pathlib.Path(__file__).resolve().parent / 'test'
+    data_dir = pathlib.Path(__file__).resolve().parent / 'data'
     if not data_dir.is_dir():
         logger.warning("数据目录不存在: %s (跳过 CVE 导入)", data_dir)
         return {"inserted": 0, "skipped": 0, "failed": 0}

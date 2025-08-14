@@ -34,8 +34,8 @@ FastAPI (keyword / 条件搜索) 直接查 ES
 |------|------|
 | db.py | 统一连接 + 初始化 schema/view |
 | CNNVD/, CNVD/, CVE/ | 各数据源 parser + ingest 脚本 |
-| llm_version_ranges.py | 批量调用 LLM 提取版本区间并写入 vuln_version_range |
-| pipeline_daily.py | 全量流程：爬取→入库→多轮 LLM→全量 ES 同步 |
+| llm_version_ranges.py | 统一遍历方式调用 LLM 提取版本区间（run_all_exhaustive + only_es_ids 增量） |
+| pipeline_daily.py | 全量流程：爬取→入库→单次遍历 LLM→全量 ES 同步 |
 | search_db.py / search_es.py | 关键字 / 产品+版本 搜索 |
 | PROJECT_MANUAL.md | 更完整的设计/维护手册 |
 
@@ -52,13 +52,16 @@ pip install -r requirements.txt
 
 ### 2. 准备 PostgreSQL / Elasticsearch
 - Postgres 建库并提供连接 (PG_DSN)
-（pipeline_daily 会自动检测并创建 Elasticsearch 索引，无需手动脚本）
+- pipeline_daily 会自动检测并创建 Elasticsearch 索引，无需手动脚本
 
 ### 3. 全量导入（首次或周期性补齐）
 ```powershell
 python pipeline_daily.py
 ```
-(包含 schema 检查 / 爬取 / LLM / ES)
+说明：
+- 若 data 目录缺失或为空，ingest 步骤会自动跳过（或仅记录 partial），不会阻断后续 LLM/ES 合并。
+- 只要数据库三表已有数据，仍会自动合并视图并同步 ES。
+- 适合“只做合并+ES重刷”场景。
 
 ### 4. 启动 API 服务（/search 与 /upload 增量导入）
 ```powershell
@@ -79,7 +82,12 @@ python main.py --file CVE/data/2025-08-14.json --src cve
 python main.py
 ```
 
-### 6. 离线构建 / 无网环境部署
+### 6. 数据库已有数据时的全量/合并行为
+- pipeline_daily.py 或 main.py（无 --file）会自动合并数据库三表，无需本地 data 文件夹。
+- ingest 步骤如遇缺失仅标记 partial，不影响 LLM/ES 合并。
+- 只要表有数据，视图和 ES 都会被重建/同步。
+
+### 7. 离线构建 / 无网环境部署
 目标：目标服务器无外网，仅能接收打包文件或镜像。
 
 方式 A：直接传输已构建镜像
@@ -117,36 +125,36 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 | ES_INDEX | test_vulnerabilities | 索引名 (默认 test_vulnerabilities) |
 | QWEN_COMPLETION_URL | (需配置) | LLM 接口地址 |
 | QWEN_MODEL | Qwen | 模型名 |
-| BATCH | 1000 | 单次 LLM 抽取批次查询上限 |
-| MAX_WORKERS | 8 | LLM 线程池大小 |
-| LLM_CONCURRENCY | 4 | 并发调用上限 (Semaphore) |
+| BATCH | 1000 | 每批从数据库抓取任务上限 |
+| MAX_WORKERS | 8 | 线程池大小（批次内并发 worker 数） |
+| LLM_CONCURRENCY | 4 | 实际 LLM 调用并发上限 (信号量) |
 | REQUEST_TIMEOUT | 60 | 单次 LLM 请求超时秒 |
 | LLM_RETRIES | 2 | LLM 失败或空结果时额外重试次数（不含首次） |
 | LLM_RETRY_BACKOFF_BASE | 1.5 | 重试指数退避基数 (sleep = base^(attempt-1) 上限10s) |
 | ENABLE_FALLBACK | true | LLM 失败/空结果后启用启发式回退抽取 |
 | INSERT_PLACEHOLDER_ON_EMPTY | true | 最终仍无结果时写入占位 (product_id=placeholder, 0.0.0) 保证有记录 |
-| TEST_MODE | false | true 时使用随机少量样本 |
-| TEST_LIMIT | 20 | TEST_MODE 下样本条数 |
 | EXTRACTOR_VER | 1 | 版本抽取器版本号（用于跳过已处理数据） |
 | LLM_THREADS | 4 | pipeline 兼容参数（实际并发由 MAX_WORKERS/LLM_CONCURRENCY 控制） |
-| (已移除锁相关变量) |  | pipeline 已不使用文件锁 |
-| VR_MAX_LOOPS | 5 | pipeline 中多轮 LLM 抽取最多循环次数 |
-| VR_STOP_ON_ZERO | true | 某轮 processed=0 时提前停止 |
+| INTRA_BATCH_LOG_EVERY | 100 | 单批内处理多少条输出一次进度日志 |
+| HEARTBEAT_SEC | 30 | 单批内若超过该秒数无完成则输出心跳进度 |
+| (已废弃 TEST_MODE / TEST_LIMIT / VR_MAX_LOOPS / VR_STOP_ON_ZERO) |  | 统一遍历后不再使用，多轮逻辑已删除 |
 | ES_SKIP_IF_EMPTY | true | 当无文档需要写入时跳过 ES 同步 |
 
 ## 全量流程 (pipeline_daily) 与 增量 (/upload)
-全量：
+全量（pipeline_daily / main 无文件参数）：
 1. ensure_schema
 2. ingest 三源（幂等追加）
-3. 多轮 LLM（VR_MAX_LOOPS / VR_STOP_ON_ZERO）
-4. 汇总视图全部文档 → ES upsert
+3. run_all_exhaustive 一次性遍历所有未达到当前 EXTRACTOR_VER 的 es_id（不再多轮）
+4. 汇总视图全部文档 → ES bulk upsert
 5. 输出 summary JSON
 
-增量：
-1. 单文件解析并入库
-2. mode=incremental → 针对该文件产生的 es_id 单轮 LLM + ES
-3. mode=full → 触发全量多轮（耗时）
-4. 返回插入与处理统计
+增量（/upload mode=incremental）：
+1. 解析上传文件并入库（新 es_id）
+2. run_all_exhaustive(only_es_ids=[...])：仅遍历该集合直到处理完（跳过已存在 >=EXTRACTOR_VER 的）
+3. 仅同步这些 es_id 到 ES（bulk）
+4. 返回统计
+
+mode=full 仍执行全量 run_all_exhaustive。
 
 失败与健壮性：
 - LLM：重试 → 回退 → 占位。
@@ -154,13 +162,15 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 - 全量 summary 标记 partial 若存在失败。
 
 ## LLM 版本范围抽取
-- 只处理 merged_vulnerabilities_view 中尚未达到当前 EXTRACTOR_VER 的 es_id
-- 多线程 + 并发限制 (MAX_WORKERS + LLM_CONCURRENCY)
-- 失败 / 空结果：进入重试（指数退避）直到耗尽 LLM_RETRIES
-- 若仍无：可启用 ENABLE_FALLBACK 的启发式回退；最终仍空且 INSERT_PLACEHOLDER_ON_EMPTY=true 则写占位
-- 每条写入前删除旧同 es_id 记录，保证最新抽取（需要 DELETE 权限）
-- 区间合并：输出 items 归并为离散区间转 version_text 保存
-- 统计字段：processed / skipped / empty / failed / inserted_products / fallback_used / placeholders / retry_total / elapsed_sec
+统一遍历模式：
+1. 每批（BATCH）查询未达当前 EXTRACTOR_VER 的 es_id；若指定 only_es_ids 则限定集合。
+2. 批次内线程池 (MAX_WORKERS) 并发 worker；LLM 调用再受 LLM_CONCURRENCY 信号量节流。
+3. 每条：LLM 调用 → 重试 (LLM_RETRIES, 指数退避) → 回退启发式 (ENABLE_FALLBACK) → 占位 (INSERT_PLACEHOLDER_ON_EMPTY)。
+4. 写入：先 DELETE 旧记录，再 UPSERT 新区间；占位将被后续更高 EXTRACTOR_VER 覆盖。
+5. 日志：
+  - 批次开始/结束统计 (processed / failed / empty / skipped / placeholders / fallback / rows)。
+  - 批次内每 INTRA_BATCH_LOG_EVERY 条日志进度；若超 HEARTBEAT_SEC 未有完成输出心跳。
+6. 统计字段（最终汇总）：total_tasks, processed, skipped, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec。
 
 ## 手动常用操作
 单独运行 LLM 抽取:
@@ -201,9 +211,9 @@ Q: LLM 超时 / 429？
 A: 已内置重试 + 指数退避，可调 LLM_RETRIES / LLM_RETRY_BACKOFF_BASE；必要时降低 LLM_CONCURRENCY 或提升 REQUEST_TIMEOUT。
 
 Q: 为什么会出现 placeholder 记录？
-A: 当 LLM 抽取与回退均无结果且 INSERT_PLACEHOLDER_ON_EMPTY=true，为保持数据完整性写入占位，以便后续统计；可在提升模型后提高 EXTRACTOR_VER 重新跑覆盖。
+A: 当 LLM 抽取与回退均无结果且 INSERT_PLACEHOLDER_ON_EMPTY=true，为保持数据完整性写入占位；升级 EXTRACTOR_VER 后统一重新抽取覆盖。
 
 Q: 如何新增新的漏洞源？
 A: 新增表 + parser + ingest_xxx.py；更新 ensure_schema & merged_vulnerabilities_view；ES 读取视图即可。
 
-更多细节参见 PROJECT_MANUAL.md。
+更多细节参见 PROJECT_MANUAL.md（已更新为统一遍历模式）。

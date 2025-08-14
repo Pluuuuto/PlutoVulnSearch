@@ -1,7 +1,6 @@
 # 排除不需打包内容
 __pycache__/
 *.pyc
-log/
 CNNVD/data/
 CNNVD/log/
 CNVD/data/

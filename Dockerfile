@@ -6,7 +6,7 @@ FROM python:3.10-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PG_DSN="host=pg01 port=5432 dbname=test user=test password=test" \
-    ES_URL="http://pg01:9200" \
+    ES_URL="http://es01:9200" \
     ES_INDEX="test_vulnerabilities"
 
 # 工作目录

@@ -1,27 +1,16 @@
-"""LLM 版本区间抽取模块
+"""LLM 版本区间抽取模块（统一遍历模式）
 
-功能：
-    1. 读取待处理 es_id + affected_products（按 extractor_ver 过滤）
-    2. 多线程调用 Qwen 抽取产品版本条件
-    3. 解析区间 → 规范化 → UPSERT 写入 vuln_version_range
+仅保留一个入口：run_all_exhaustive(..., only_es_ids=None)
+    - 全量：only_es_ids=None → 逐批拉取所有尚未抽取 (extractor_ver 覆盖) 的漏洞直到耗尽。
+    - 增量：only_es_ids=[...] → 仅在给定集合内遍历，直到这些 es_id 全部写入/跳过。
 
-直接运行：python llm_version_ranges.py  # 执行一批（受 TEST_MODE / BATCH 控制）
-集成方式：from llm_version_ranges import run_batch; stats = run_batch()
-返回 stats 示例：
-    {
-        'total_tasks': 120,
-        'processed': 90,
-        'skipped': 20,
-        'empty': 5,
-        'failed': 5,
-        'inserted_products': 210,
-        'elapsed_sec': 12.34
-    }
+不再保留 run_batch / fill_missing_placeholders：占位仍由 worker 内置 INSERT_PLACEHOLDER_ON_EMPTY 控制。
 """
 # 多线程版本：读取待处理列表 → 并发调用 Qwen → 写入 vuln_version_range
 import os, json, hashlib, logging, traceback, time
 import psycopg2
 import psycopg2.extras as pg_extras
+from psycopg2.extras import execute_values
 import psycopg2.pool as pg_pool
 import requests
 from datetime import datetime
@@ -63,10 +52,9 @@ ENABLE_FALLBACK = os.getenv("ENABLE_FALLBACK", "true").lower() in ("1","true","y
 LLM_RETRIES = int(os.getenv("LLM_RETRIES", "2"))             # LLM 失败或空结果时额外重试次数（不含首次）
 LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))  # 重试指数退避基数
 INSERT_PLACEHOLDER_ON_EMPTY = os.getenv("INSERT_PLACEHOLDER_ON_EMPTY", "true").lower() in ("1","true","yes","y")
+INTRA_BATCH_LOG_EVERY = int(os.getenv("INTRA_BATCH_LOG_EVERY", "100"))  # 单批多少条输出一次进度
 
-# 模式
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1","true","yes","y")
-TEST_LIMIT = int(os.getenv("TEST_LIMIT", "20"))
+#（已移除 TEST_MODE/TEST_LIMIT：采用直接遍历或 only_es_ids）
 
 # ====================== 版本解析与区间处理 ======================
 def parse_semver(s: str) -> Tuple[int,int,int,int]:
@@ -321,13 +309,14 @@ def md5(s: str) -> str:
     """生成字符串 MD5（空串安全）。"""
     return hashlib.md5((s or "").encode("utf-8")).hexdigest()
 
-def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]):
+def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]) -> int:
     """按产品列表写入区间：
     - 先删除旧 es_id（保持最新抽取）
-    - 对每个区间 UPSERT（幂等 + 更新 meta 字段）"""
+    - 对每个区间 UPSERT（幂等 + 更新 meta 字段）
+    返回：写入/更新的区间行数（不区分 insert/update）。"""
     raw_hash = md5(src_text)
+    row_count = 0
     with conn.cursor() as cur:
-        # 如无 DELETE 权限可去掉本句，但可能导致旧区间残留
         cur.execute("DELETE FROM vuln_version_range WHERE es_id=%s", (es_id,))
         for p in products or []:
             pid = (p.get("product_id") or "unknown").strip().lower()
@@ -337,17 +326,22 @@ def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]
             conf = float(p.get("confidence") or 0.0)
             for lo, hi, as_, bs_, incl_a, incl_b in ivs:
                 vtext = interval_to_text([(lo, hi, as_, bs_, incl_a, incl_b)])
-                cur.execute("""
-                  INSERT INTO vuln_version_range
-                  (es_id, product_id, min_code, max_code, confidence, version_text, source_text, raw_hash, extractor_ver)
-                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                  ON CONFLICT (es_id, product_id, min_code, max_code)
-                  DO UPDATE SET confidence=EXCLUDED.confidence,
-                                version_text=EXCLUDED.version_text,
-                                source_text=EXCLUDED.source_text,
-                                raw_hash=EXCLUDED.raw_hash,
-                                extractor_ver=EXCLUDED.extractor_ver
-                """, (es_id, pid, lo, hi, conf, vtext, src_text, raw_hash, EXTRACTOR_VER))
+                cur.execute(
+                    """
+                    INSERT INTO vuln_version_range
+                    (es_id, product_id, min_code, max_code, confidence, version_text, source_text, raw_hash, extractor_ver)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (es_id, product_id, min_code, max_code)
+                    DO UPDATE SET confidence=EXCLUDED.confidence,
+                                  version_text=EXCLUDED.version_text,
+                                  source_text=EXCLUDED.source_text,
+                                  raw_hash=EXCLUDED.raw_hash,
+                                  extractor_ver=EXCLUDED.extractor_ver
+                    """,
+                    (es_id, pid, lo, hi, conf, vtext, src_text, raw_hash, EXTRACTOR_VER)
+                )
+                row_count += 1
+    return row_count
 
 # ====================== 工作线程 ======================
 def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str, Any]:
@@ -411,12 +405,13 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
 
             if products:
                 try:
-                    upsert_ranges(conn, es_id, text, products)
+                    rows_written = upsert_ranges(conn, es_id, text, products)
                     conn.commit()
                     return {
                         "es_id": es_id,
                         "inserted": True,
                         "count": len(products),
+                        "interval_rows": rows_written,
                         "fallback": used_fallback,
                         "placeholder": used_placeholder,
                         "retries": attempts-1
@@ -443,137 +438,143 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
             if conn:
                 pool.putconn(conn)
 
-# ====================== 主流程 ======================
-def run_batch(test_mode: bool | None = None, batch: int | None = None, only_es_ids: list[str] | None = None) -> dict:
-    """执行一批抽取任务并返回统计。
+def run_all_exhaustive(batch: int | None = None, progress_every: int = 1000, only_es_ids: list[str] | None = None) -> dict:
+    """一次性遍历模式：不停拉取未处理任务直到耗尽（忽略 VR_MAX_LOOPS / TEST_MODE）。
 
-    参数:
-        test_mode    覆盖 TEST_MODE
-        batch        覆盖 BATCH (全量模式下的单批上限)
-        only_es_ids  若提供，仅处理给定 es_id 列表（增量模式）；忽略已存在当前/更高 extractor_ver 的项。
-    返回: 统计字典（详见模块顶部示例）。
+    适用：一次性全量跑完；可随时 Ctrl+C 终止，已写入的不会重复（依赖 extractor_ver 去重）。
+
+    参数：
+    batch            每次数据库 LIMIT（默认取环境 BATCH）
+    progress_every   每处理多少条打印一次进度累计。
+    only_es_ids      若提供，仅在该集合中遍历（适用于增量）。
+
+    返回：聚合统计，与 run_batch 类似但覆盖整个运行：
+      {
+        total_tasks, processed, skipped, empty, failed,
+        inserted_products, inserted_rows, fallback_used, placeholders,
+        retry_total, elapsed_sec, batches
+      }
     """
-    tm = TEST_MODE if test_mode is None else test_mode
     bt = BATCH if batch is None else batch
-
+    dsn = _effective_dsn()
     minc = max(2, min(4, MAX_WORKERS//2))
     maxc = max(MAX_WORKERS*2, 8)
-    dsn = _effective_dsn()
     pool = psycopg2.pool.SimpleConnectionPool(minc, maxc, dsn)
-
-    conn = pool.getconn()
+    total_tasks = processed = skipped = empty = failed = 0
+    inserted_products = inserted_rows = fallback_used = placeholders = retry_total = 0
+    batches = 0
+    start = time.time()
     try:
-        with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            if only_es_ids:
-                # 仅处理传入集合且尚未有 >=EXTRACTOR_VER 的记录
-                cur.execute("""
-                    SELECT mv.es_id, mv.affected_products
-                    FROM merged_vulnerabilities_view mv
-                    LEFT JOIN (
-                        SELECT DISTINCT es_id FROM vuln_version_range WHERE extractor_ver >= %s
-                    ) v ON mv.es_id = v.es_id
-                    WHERE v.es_id IS NULL AND mv.es_id = ANY(%s)
-                """, (EXTRACTOR_VER, only_es_ids))
-            elif tm:
-                cur.execute("""
-                    SELECT es_id, affected_products
-                    FROM merged_vulnerabilities_view
-                    ORDER BY random()
-                    LIMIT %s
-                """, (TEST_LIMIT,))
-            else:
-                cur.execute("""
-                    SELECT mv.es_id, mv.affected_products
-                    FROM merged_vulnerabilities_view mv
-                    LEFT JOIN (
-                        SELECT DISTINCT es_id FROM vuln_version_range WHERE extractor_ver >= %s
-                    ) v ON mv.es_id = v.es_id
-                    WHERE v.es_id IS NULL
-                    LIMIT %s
-                """, (EXTRACTOR_VER, bt))
-            tasks = cur.fetchall()
-            logger.debug(f"任务获取 rows={len(tasks)} extractor_ver>={EXTRACTOR_VER} test_mode={tm}")
-            if tasks:
-                sample = tasks[:3]
-                logger.debug("任务样例: %s", [ { 'es_id': t['es_id'], 'len_text': len(t.get('affected_products') or '') } for t in sample ])
+        while True:
+            # 拉一批未覆盖 extractor_ver 的
+            conn = pool.getconn()
+            try:
+                with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
+                    sql = """
+                        SELECT mv.es_id, mv.affected_products
+                        FROM merged_vulnerabilities_view mv
+                        LEFT JOIN (
+                            SELECT DISTINCT es_id FROM vuln_version_range WHERE extractor_ver >= %s
+                        ) v ON mv.es_id = v.es_id
+                        WHERE v.es_id IS NULL
+                        {only_filter}
+                        LIMIT %s
+                    """.format(only_filter="AND mv.es_id = ANY(%s)" if only_es_ids else "")
+                    if only_es_ids:
+                        cur.execute(sql, (EXTRACTOR_VER, only_es_ids, bt))
+                    else:
+                        cur.execute(sql, (EXTRACTOR_VER, bt))
+                    tasks = cur.fetchall()
+            finally:
+                pool.putconn(conn)
+            if not tasks:
+                logger.info("[TRAVERSE] 没有更多未处理任务，结束。")
+                break
+            batches += 1
+            total_tasks += len(tasks)
+            scope = f"only_ids={len(only_es_ids)}" if only_es_ids else "ALL"
+            logger.info(f"[TRAVERSE] 批次 {batches} 获取 {len(tasks)} 条 (batch={bt}, scope={scope})")
+            # 并发处理本批
+            processed_before = processed
+            skipped_before = skipped
+            empty_before = empty
+            failed_before = failed
+            placeholders_before = placeholders
+            fallback_before = fallback_used
+            rows_before = inserted_rows
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                done_in_batch = 0
+                heartbeat_sec = int(os.getenv('HEARTBEAT_SEC', '30'))
+                last_heartbeat = time.time()
+                futures_map = {ex.submit(worker, t, pool): t for t in tasks}
+                for fut in as_completed(futures_map):
+                    res = fut.result()
+                    if res.get('inserted'):
+                        processed += 1
+                        inserted_products += int(res.get('count') or 0)
+                        inserted_rows += int(res.get('interval_rows') or 0)
+                        retry_total += int(res.get('retries') or 0)
+                        if res.get('fallback'): fallback_used += 1
+                        if res.get('placeholder'): placeholders += 1
+                    elif res.get('skipped'):
+                        skipped += 1
+                    elif res.get('empty'):
+                        empty += 1
+                    else:
+                        failed += 1
+                    done_in_batch += 1
+                    if done_in_batch % max(1, INTRA_BATCH_LOG_EVERY) == 0:
+                        logger.info(
+                            f"[TRAVERSE][BATCH {batches}] 进度 {done_in_batch}/{len(tasks)} processed={processed-processed_before} "
+                            f"empty={empty-empty_before} skipped={skipped-skipped_before} failed={failed-failed_before} rows+={inserted_rows-rows_before}"
+                        )
+                    now = time.time()
+                    if (now - last_heartbeat) >= heartbeat_sec:
+                        logger.info(
+                            f"[TRAVERSE][BATCH {batches}] 心跳 {done_in_batch}/{len(tasks)} processed={processed-processed_before} "
+                            f"empty={empty-empty_before} skipped={skipped-skipped_before} failed={failed-failed_before} rows+={inserted_rows-rows_before} (threads={MAX_WORKERS})"
+                        )
+                        last_heartbeat = now
+            # 本批增量统计
+            batch_processed = processed - processed_before
+            batch_failed = failed - failed_before
+            batch_empty = empty - empty_before
+            batch_skipped = skipped - skipped_before
+            batch_placeholders = placeholders - placeholders_before
+            batch_fallback = fallback_used - fallback_before
+            batch_rows = inserted_rows - rows_before
+            logger.info(
+                f"[TRAVERSE] 批次 {batches} 完成: 本批 processed={batch_processed} failed={batch_failed} empty={batch_empty} "
+                f"skipped={batch_skipped} placeholders={batch_placeholders} fallback={batch_fallback} rows={batch_rows}; "
+                f"累计 processed={processed} failed={failed} placeholders={placeholders} rows={inserted_rows}"
+            )
+            if processed and processed % progress_every == 0:
+                logger.info(f"[TRAVERSE] 累计 processed={processed} inserted_rows={inserted_rows} failed={failed} placeholders={placeholders}")
+        elapsed = time.time() - start
+        stats = {
+            'mode': 'traverse_all',
+            'total_tasks': total_tasks,
+            'processed': processed,
+            'skipped': skipped,
+            'empty': empty,
+            'failed': failed,
+            'inserted_products': inserted_products,
+            'inserted_rows': inserted_rows,
+            'fallback_used': fallback_used,
+            'placeholders': placeholders,
+            'retry_total': retry_total,
+            'batches': batches,
+            'elapsed_sec': round(elapsed, 3)
+        }
+        logger.info(f"[TRAVERSE] 完成 {stats}")
+        return stats
     finally:
-        pool.putconn(conn)
-
-    if not tasks:
-        logger.info("没有需要处理的数据。")
         try: pool.closeall()
         except Exception: pass
-        return {
-            'total_tasks': 0,
-            'processed': 0,
-            'skipped': 0,
-            'empty': 0,
-            'failed': 0,
-            'inserted_products': 0,
-            'elapsed_sec': 0.0
-        }
-
-    logger.info(f"本批待处理: {len(tasks)} 条，线程: {MAX_WORKERS}，LLM并发: {LLM_CONCURRENCY}")
-
-    ok, skip, empty, err, prod_total = 0, 0, 0, 0, 0
-    fb_cnt = 0
-    ph_cnt = 0
-    retry_total = 0
-    started = time.time()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        future_map = {ex.submit(worker, t, pool): t for t in tasks}
-        for fut in as_completed(future_map):
-            res = fut.result()
-            es_id = res.get("es_id")
-            if res.get("inserted"):
-                ok += 1
-                prod_total += int(res.get('count') or 0)
-                retry_total += int(res.get('retries') or 0)
-                if res.get("fallback"):
-                    fb_cnt += 1
-                if res.get("placeholder"):
-                    ph_cnt += 1
-                tag = []
-                if res.get("fallback"): tag.append("fallback")
-                if res.get("placeholder"): tag.append("placeholder")
-                if res.get('retries'):
-                    tag.append(f"retries={res.get('retries')}")
-                tag_str = (" " + ",".join(tag)) if tag else ""
-                logger.info(f"✅ 写入完成 {es_id}（products={res.get('count')}){tag_str}")
-            elif res.get("skipped"):
-                skip += 1
-                logger.debug(f"跳过已处理 {es_id}")
-            elif res.get("empty"):
-                empty += 1
-                logger.info(f"⚠️ 无抽取结果 {es_id}")
-            else:
-                err += 1
-                logger.error(f"❌ 失败 {es_id}: {res.get('error')}")
-
-    elapsed = time.time() - started
-    stats = {
-        'total_tasks': len(tasks),
-        'processed': ok,
-        'skipped': skip,
-        'empty': empty,
-        'failed': err,
-        'inserted_products': prod_total,
-        'elapsed_sec': round(elapsed, 3),
-        'fallback_used': fb_cnt,
-        'placeholders': ph_cnt,
-        'retry_total': retry_total
-    }
-    logger.info("批次完成统计 %s", stats)
-
-    try:
-        pool.closeall()
-    except Exception:
-        pass
-    return stats
 
 
-def main():  # 保持向后兼容脚本执行
-    run_batch()
+def main():  # 直接全量遍历
+    run_all_exhaustive()
 
 
 if __name__ == "__main__":

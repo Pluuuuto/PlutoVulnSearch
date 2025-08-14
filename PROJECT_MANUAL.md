@@ -1,6 +1,6 @@
 # PlutoVulnSearch 项目手册
 
-版本：2025-08-14 (修订：去除文件锁 / 增量模式说明 / 视图 cve_id 简化)
+版本：2025-08-14 (修订：统一遍历模式 / 去除 run_batch & 多轮变量 / 去除文件锁 / 视图 cve_id 简化)
 
 ## 目录
 - [PlutoVulnSearch 项目手册](#plutovulnsearch-项目手册)
@@ -20,7 +20,7 @@
     - [4.4 pipeline\_daily.py](#44-pipeline_dailypy)
     - [4.5 search\_es.py / search\_db.py](#45-search_espy--search_dbpy)
   - [5. 日常自动化流程 (pipeline\_daily)](#5-日常自动化流程-pipeline_daily)
-  - [6. LLM 版本区间抽取设计（增强）](#6-llm-版本区间抽取设计增强)
+  - [6. LLM 版本区间抽取设计（统一遍历）](#6-llm-版本区间抽取设计统一遍历)
   - [7. Elasticsearch 索引与搜索](#7-elasticsearch-索引与搜索)
   - [8. 代码规范与约定](#8-代码规范与约定)
   - [9. 运维与部署建议](#9-运维与部署建议)
@@ -139,38 +139,36 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 - 外部文件批量导入：通过 FastAPI `/upload` 接口（app.py）上传 JSON/NDJSON。
 
 ### 4.3 llm_version_ranges.py
-核心：`run_batch()` 可复用，一次处理一批（BATCH 条）任务并返回统计。
+统一单入口：`run_all_exhaustive(batch=None, progress_every=..., only_es_ids=None)`。
 
-任务获取：
-- TEST_MODE=true：随机抽样 TEST_LIMIT 条
-- 否则：`merged_vulnerabilities_view` 中未达到当前 `EXTRACTOR_VER` 的 es_id（左连接 vuln_version_range 过滤）
+模式说明：
+- 全量：`only_es_ids=None` 时循环抓取批次（大小取 BATCH env）直至没有未达当前 `EXTRACTOR_VER` 的 es_id。
+- 增量：`only_es_ids=[...]` 限定集合处理（若已是最新版本则跳过），用于外部上传触发的局部刷新。
 
-多线程 & 并发：
-- 线程池大小 `MAX_WORKERS`
-- LLM 调用并发通过 `LLM_CONCURRENCY` (BoundedSemaphore) 限流
+并发与控制：
+- 线程池大小：`MAX_WORKERS`
+- LLM 并发：`LLM_CONCURRENCY`（BoundedSemaphore）
+- 批内进度：每完成 `INTRA_BATCH_LOG_EVERY` 条输出一行；若超过 `HEARTBEAT_SEC` 秒无完成事件输出心跳（包含累计完成/剩余估计）。
 
-重试 / 回退 / 占位（保证“都有记录”）：
-1. 每条初次调用 LLM；若失败或返回空 products：进入重试，最多 `LLM_RETRIES` 额外次数，指数退避时间 `LLM_RETRY_BACKOFF_BASE^(attempt-1)`（上限 10s）。
-2. 全部尝试后仍失败/空且 `ENABLE_FALLBACK=true`：启用启发式 fallback（基于简单正则抓取版本，置信度低）。
-3. 仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY=true`：写入占位记录 `product_id=placeholder, version 0.0.0`，置信度 0，用于完整性与后续再加工标记。
+处理流水（单任务 worker）：
+1. 读取原始 affected_products 文本（视图字段统一名称）。
+2. LLM JSON 抽取（失败/空触发重试；重试次数 = 1 + `LLM_RETRIES`）。
+3. 全部失败或仍空 → 可选回退：启用 `ENABLE_FALLBACK` 时基于 regex 拆出 eq 版本。
+4. 仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY=true` → 占位记录：`product_id=placeholder, version=0.0.0, confidence=0`。
+5. 归并：`items_to_intervals()` 得到规范区间 (min_code,max_code) 与 version_text。
+6. 写入：先 DELETE 该 es_id 旧记录，再批量 INSERT（带 `extractor_ver`）。
 
-写入策略：
-- 写入前删除同 es_id 旧记录（需要 DELETE 权限；若权限不足，可去掉删除，但会残留旧数据）。
-- 区间归并：LLM items → `items_to_intervals()` 生成 (min_code,max_code) + version_text。
-- 并发安全：每 task 在 worker 内再次 select 进行断点续跑检查，避免重复写入。
+版本编码：`a*1e9 + b*1e6 + c*1e3 + d` 支持最多四段（含 u → 0 处理）。
 
-版本编码：`a*1e9 + b*1e6 + c*1e3 + d` 支持最多四段（含 u 转换）。
+统计（run_all_exhaustive 返回）：`total_tasks, processed, skipped, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec`。
 
-统计字段（run_batch 返回）：
-`total_tasks, processed, skipped, empty, failed, inserted_products, elapsed_sec, fallback_used, placeholders, retry_total`。
-
-升级 / 重新抽取：当算法优化或模型升级时提升 `EXTRACTOR_VER`，旧 es_id 会再次成为候选，从而覆盖占位或低质量记录。
+再抽取：提升 `EXTRACTOR_VER` 即可让全部（含 placeholder）重新进入候选，覆盖老版本输出。
 
 ### 4.4 pipeline_daily.py
-全量脚本（已移除文件锁，假设单实例）：
+全量脚本（无文件锁，假设单实例）：
 1. ensure_schema
 2. ingest 三源
-3. 多轮 LLM（VR_MAX_LOOPS / VR_STOP_ON_ZERO）
+3. 统一遍历 LLM（单次 run_all_exhaustive 覆盖全部待处理）
 4. 组装全部视图文档 → ES upsert
 5. 输出 summary JSON
 
@@ -182,20 +180,19 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ---
 ## 5. 全量 vs 增量流程
-全量：见 4.4。适合作周期性补齐 / 再抽取。
-增量：FastAPI `/upload` 单文件导入；mode=incremental 仅对该文件对应 es_id 做单轮 LLM + ES；mode=full 触发全量多轮（耗时）。
-
-稳健性：LLM 保证每条最终有一条记录（真实或 placeholder），避免后续视图/映射断裂；失败统计不会中断主流程，除非为致命错误。
+全量：`run_all_exhaustive()` 覆盖所有未达当前 `EXTRACTOR_VER` 的 es_id。
+增量：上传文件后解析得到受影响 es_id 列表，调用 `run_all_exhaustive(only_es_ids=...)`；随后仅对这些 ID 进行 ES upsert。
+稳健性：任何 es_id 最终至少 1 条记录（真实或 placeholder），保持 ES 文档 version_ranges 数组存在，利于统计与查询统一。
 
 ---
-## 6. LLM 版本区间抽取设计（增强）
+## 6. LLM 版本区间抽取设计（统一遍历）
 输入：`affected_products` 原始产品与版本描述（多源字段标准化后的汇总）。
 输出：标准 JSON（products 数组）。`items` 支持类型：`lt/lte/gt/gte/eq/range/wildcard/list`。
 
 处理流水：
 1. 任务筛选：按 `EXTRACTOR_VER` 过滤，确保升级后可重新处理旧数据。
-2. LLM 调用：Qwen 接口；失败 / 非 200 / 解析异常抛错交由重试机制。
-3. 重试：最多 1 + LLM_RETRIES 次；指数退避；判定“空”也算重试触发条件。
+2. LLM 调用：Qwen 接口；失败 / 非 200 / 解析异常 → 触发重试。
+3. 重试：最多 1 + LLM_RETRIES 次；指数退避；空 products 也算重试触发条件。
 4. 回退：启用 `ENABLE_FALLBACK` 时对文本进行启发式拆分与版本正则抽取，生成 eq items。
 5. 占位：若仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY` 为 true，写 placeholder 记录（product_id=placeholder, version=0.0.0）
 6. 区间合并：`items_to_intervals()` 解析为离散区间 + 可读 `version_text`。
@@ -205,12 +202,15 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 统计指标：
 - processed / failed / empty / skipped
-- fallback_used（多少条使用回退）
-- placeholders（写入占位的条数）
-- retry_total（总重试次数，便于观测稳定性）
-- inserted_products（写入的产品条目聚合）
+- fallback_used（使用回退的任务数）
+- placeholders（写入占位的任务数）
+- retry_total（总重试次数）
+- inserted_products（写入的产品条目数聚合）
+- inserted_rows（最终写入区间行数）
+- batches（批次数）
+- elapsed_sec（总耗时秒）
 
-再抽取策略：当模型或解析逻辑升级：提升 `EXTRACTOR_VER` → 旧数据全部重新纳入任务（包括 placeholder）。
+再抽取策略：提升 `EXTRACTOR_VER` → 全量重新纳入任务（包含 placeholder），保证覆盖低质量历史结果。
 
 ---
 ## 7. Elasticsearch 索引与搜索
@@ -240,8 +240,9 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 关键环境变量（补充）：
 - 重试相关：LLM_RETRIES, LLM_RETRY_BACKOFF_BASE
 - 回退 / 占位：ENABLE_FALLBACK, INSERT_PLACEHOLDER_ON_EMPTY
-- 多轮：VR_MAX_LOOPS, VR_STOP_ON_ZERO
 - 版本迭代：EXTRACTOR_VER（升级算法后递增）
+- 批次与并发：BATCH, MAX_WORKERS, LLM_CONCURRENCY
+- 批内日志：INTRA_BATCH_LOG_EVERY, HEARTBEAT_SEC
 - ES 优化：ES_SKIP_IF_EMPTY 避免空跑
 
 健康检查：
@@ -270,7 +271,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 3. 风险级别统一：引入专门 risk_score 数值模型。
 4. API 服务：FastAPI 封装搜索、统计、导出。
 5. 监控：Prometheus + Grafana（处理量 / 失败数 / LLM 耗时）。
-6. 重试策略：已实现一次批内多次重试 + 多轮循环；可新增失败任务持久化队列实现延迟重试。
+6. 重试策略：已实现单任务多次重试（无多轮）；可新增失败任务持久化队列实现延迟重试。
 7. 产品名归一：基于别名字典或 embeddings 归一化 product_id；占位可作为人工标注起点。
 8. 视图性能：改物化视图 + 定时 refresh。
 9. 安全审核：对外部输出做脱敏处理（若涉及 POC）。

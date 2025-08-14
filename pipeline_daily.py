@@ -42,7 +42,7 @@ import psycopg2.extras
 import requests
 
 from db import ensure_schema, get_conn
-from llm_version_ranges import run_batch as llm_run_batch
+from llm_version_ranges import run_all_exhaustive
 
 # Configure logging early
 logging.basicConfig(
@@ -58,9 +58,45 @@ LOG = logging.getLogger('pipeline')
 ES_URL = os.getenv('ES_URL', 'http://localhost:9200')
 ES_INDEX = os.getenv('ES_INDEX', 'test_vulnerabilities')
 LLM_THREADS = int(os.getenv('LLM_THREADS', '4'))  # placeholder (actual concurrency inside module)
-VR_MAX_LOOPS = int(os.getenv('VR_MAX_LOOPS', '5'))
-VR_STOP_ON_ZERO = os.getenv('VR_STOP_ON_ZERO', 'true').lower() in ('1','true','yes','y')
+# === 模式切换：改为一次性遍历抽取（不再使用多轮控制） ===
 ES_SKIP_IF_EMPTY = os.getenv('ES_SKIP_IF_EMPTY', 'true').lower() in ('1','true','yes','y')
+TRAVERSE_BATCH = int(os.getenv('TRAVERSE_BATCH', os.getenv('BATCH', '1000')))  # 默认复用 LLM 脚本 BATCH
+TRAVERSE_PROGRESS_EVERY = int(os.getenv('TRAVERSE_PROGRESS_EVERY', '2000'))
+
+def compute_coverage_stats() -> dict:
+    """统计版本区间覆盖率。一次性遍历后应当 uncovered=0（若启用占位策略）。"""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM merged_vulnerabilities_view")
+        total_vulns = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT es_id) FROM vuln_version_range")
+        covered_vulns = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*) FROM (
+              SELECT es_id, bool_and(product_id='placeholder') AS all_ph
+              FROM vuln_version_range
+              GROUP BY es_id
+              HAVING bool_and(product_id='placeholder')
+            ) t
+        """)
+        placeholder_only_vulns = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM vuln_version_range")
+        total_version_rows = cur.fetchone()[0]
+    real_extracted_vulns = covered_vulns - placeholder_only_vulns
+    uncovered_vulns = total_vulns - covered_vulns
+    def pct(n):
+        return round(n / total_vulns * 100, 3) if total_vulns else 0.0
+    return {
+        'total_vulns': total_vulns,
+        'covered_vulns': covered_vulns,
+        'real_extracted_vulns': real_extracted_vulns,
+        'placeholder_only_vulns': placeholder_only_vulns,
+        'uncovered_vulns': uncovered_vulns,
+        'total_version_rows': total_version_rows,
+        'real_pct': pct(real_extracted_vulns),
+        'placeholder_pct': pct(placeholder_only_vulns),
+        'uncovered_pct': pct(uncovered_vulns)
+    }
 
 # Import ingestion routines dynamically (fallback if missing)
 def run_ingest(label: str, module_path: str) -> Dict[str, int]:
@@ -105,7 +141,7 @@ def run_ingest(label: str, module_path: str) -> Dict[str, int]:
                 del sys.modules[name]
 
 #############################################
-# LLM 版本区间抽取：使用 llm_version_ranges.run_batch
+# LLM 版本区间抽取：现在统一使用一次性遍历 (run_all_exhaustive)；增量模式单批 only_es_ids。
 #############################################
 
 # Elasticsearch index helpers
@@ -244,37 +280,14 @@ def main():
         if any(v['failed'] == -1 for v in ingest_stats.values()):
             partial = True
 
-        # Multi-loop LLM extraction (accumulate stats)
-        llm_loops: list[dict] = []
-        accumulated = {
-            'total_tasks': 0,
-            'processed': 0,
-            'skipped': 0,
-            'empty': 0,
-            'failed': 0,
-            'inserted_products': 0,
-            'fallback_used': 0,
-            'placeholders': 0,
-            'retry_total': 0,
-        }
-        for loop in range(1, VR_MAX_LOOPS + 1):
-            loop_stats = llm_run_batch()
-            for k in list(loop_stats.keys()):
-                if k not in accumulated and k not in ('elapsed_sec',):
-                    pass
-            for k in accumulated:
-                accumulated[k] += int(loop_stats.get(k, 0) or 0)
-            llm_loops.append(loop_stats)
-            LOG.info("LLM loop %d stats %s", loop, loop_stats)
-            if VR_STOP_ON_ZERO and (loop_stats.get('processed', 0) == 0):
-                break
-        vr_stats = {
-            'loops': len(llm_loops),
-            'loops_detail': llm_loops,
-            'accumulated': accumulated
-        }
-        if accumulated['failed'] > 0:
+        # 一次性遍历抽取（直到耗尽）
+        traverse_stats = run_all_exhaustive(batch=TRAVERSE_BATCH, progress_every=TRAVERSE_PROGRESS_EVERY)
+        if traverse_stats.get('failed', 0) > 0:
             partial = True
+        vr_stats = {'mode': 'traverse_all', 'stats': traverse_stats}
+
+        # 遍历后直接统计覆盖（单次，无 before/after 对比）
+        coverage_after = compute_coverage_stats()
 
         docs_iter = list(fetch_docs_for_es())
         if not docs_iter and ES_SKIP_IF_EMPTY:
@@ -291,6 +304,7 @@ def main():
             'run_end': datetime.now(timezone.utc).isoformat(),
             'ingest': ingest_stats,
             'version_ranges': vr_stats,
+            'coverage': coverage_after,
             'es': es_stats,
             'status': 'partial' if partial else 'success'
         }
@@ -304,39 +318,14 @@ def main():
         LOG.exception("Fatal pipeline error")
         sys.exit(2)
 
-if __name__ == '__main__':
-    main()
 #############################################################
 # 增量同步（上传触发场景）
 #############################################################
 
 def _run_llm_multi_loop() -> dict:
-    """执行多轮 LLM 抽取（无锁，不做 ingestion），返回统计。供上传触发增量使用。"""
-    llm_loops: list[dict] = []
-    accumulated = {
-        'total_tasks': 0,
-        'processed': 0,
-        'skipped': 0,
-        'empty': 0,
-        'failed': 0,
-        'inserted_products': 0,
-        'fallback_used': 0,
-        'placeholders': 0,
-        'retry_total': 0,
-    }
-    for loop in range(1, VR_MAX_LOOPS + 1):
-        loop_stats = llm_run_batch()
-        for k in accumulated:
-            accumulated[k] += int(loop_stats.get(k, 0) or 0)
-        llm_loops.append(loop_stats)
-        LOG.info("[INCREMENTAL] LLM loop %d stats %s", loop, loop_stats)
-        if VR_STOP_ON_ZERO and (loop_stats.get('processed', 0) == 0):
-            break
-    return {
-        'loops': len(llm_loops),
-        'loops_detail': llm_loops,
-        'accumulated': accumulated
-    }
+    """兼容调用入口：full 模式一次性遍历抽取。"""
+    stats = run_all_exhaustive(batch=TRAVERSE_BATCH, progress_every=TRAVERSE_PROGRESS_EVERY)
+    return {'mode': 'traverse_all', 'stats': stats}
 
 def incremental_sync(run_llm: bool = True, es_sync: bool = True, mode: str = "incremental", es_ids: list[str] | None = None) -> dict:
     """上传文件后调用：执行 LLM 抽取与 ES 同步。
@@ -350,27 +339,15 @@ def incremental_sync(run_llm: bool = True, es_sync: bool = True, mode: str = "in
     vr_stats = {}
     target_ids = es_ids if (mode == 'incremental') else None
     if run_llm:
-        from llm_version_ranges import run_batch as _rb
         if mode == 'incremental':
             if not target_ids:
                 vr_stats = {'loops': 0, 'accumulated': {k:0 for k in ['total_tasks','processed','skipped','empty','failed','inserted_products','fallback_used','placeholders','retry_total']}}
             else:
-                # 单轮即可：调用 run_batch only_es_ids
-                stats = _rb(only_es_ids=target_ids)
+                # 使用统一遍历：限定 only_es_ids
+                stats = run_all_exhaustive(batch=TRAVERSE_BATCH, progress_every=TRAVERSE_PROGRESS_EVERY, only_es_ids=target_ids)
                 vr_stats = {
-                    'loops': 1,
-                    'loops_detail': [stats],
-                    'accumulated': {
-                        'total_tasks': stats.get('total_tasks',0),
-                        'processed': stats.get('processed',0),
-                        'skipped': stats.get('skipped',0),
-                        'empty': stats.get('empty',0),
-                        'failed': stats.get('failed',0),
-                        'inserted_products': stats.get('inserted_products',0),
-                        'fallback_used': stats.get('fallback_used',0),
-                        'placeholders': stats.get('placeholders',0),
-                        'retry_total': stats.get('retry_total',0)
-                    }
+                    'mode': 'traverse_incremental',
+                    'stats': stats
                 }
         else:  # full
             vr_stats = _run_llm_multi_loop()
@@ -417,3 +394,6 @@ def incremental_sync(run_llm: bool = True, es_sync: bool = True, mode: str = "in
         'version_ranges': vr_stats,
         'es': es_stats
     }
+
+if __name__ == '__main__':
+    main()
