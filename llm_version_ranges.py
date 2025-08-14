@@ -444,14 +444,14 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
                 pool.putconn(conn)
 
 # ====================== 主流程 ======================
-def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
+def run_batch(test_mode: bool | None = None, batch: int | None = None, only_es_ids: list[str] | None = None) -> dict:
     """执行一批抽取任务并返回统计。
 
-    参数: test_mode 覆盖 TEST_MODE; batch 覆盖 BATCH。
-    返回: 统计字典（详见模块顶部示例）。"""
-    """执行一批抽取任务并返回统计。
-
-    参数允许覆盖环境变量以便 pipeline 细粒度控制。
+    参数:
+        test_mode    覆盖 TEST_MODE
+        batch        覆盖 BATCH (全量模式下的单批上限)
+        only_es_ids  若提供，仅处理给定 es_id 列表（增量模式）；忽略已存在当前/更高 extractor_ver 的项。
+    返回: 统计字典（详见模块顶部示例）。
     """
     tm = TEST_MODE if test_mode is None else test_mode
     bt = BATCH if batch is None else batch
@@ -464,7 +464,17 @@ def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
     conn = pool.getconn()
     try:
         with conn.cursor(cursor_factory=pg_extras.RealDictCursor) as cur:
-            if tm:
+            if only_es_ids:
+                # 仅处理传入集合且尚未有 >=EXTRACTOR_VER 的记录
+                cur.execute("""
+                    SELECT mv.es_id, mv.affected_products
+                    FROM merged_vulnerabilities_view mv
+                    LEFT JOIN (
+                        SELECT DISTINCT es_id FROM vuln_version_range WHERE extractor_ver >= %s
+                    ) v ON mv.es_id = v.es_id
+                    WHERE v.es_id IS NULL AND mv.es_id = ANY(%s)
+                """, (EXTRACTOR_VER, only_es_ids))
+            elif tm:
                 cur.execute("""
                     SELECT es_id, affected_products
                     FROM merged_vulnerabilities_view
@@ -548,10 +558,10 @@ def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
         'empty': empty,
         'failed': err,
         'inserted_products': prod_total,
-    'elapsed_sec': round(elapsed, 3),
-    'fallback_used': fb_cnt,
-    'placeholders': ph_cnt,
-    'retry_total': retry_total
+        'elapsed_sec': round(elapsed, 3),
+        'fallback_used': fb_cnt,
+        'placeholders': ph_cnt,
+        'retry_total': retry_total
     }
     logger.info("批次完成统计 %s", stats)
 

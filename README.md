@@ -17,7 +17,7 @@
 - 常见问题
 
 ## 背景与目标
-每日自动：爬取 (CVE / CNVD / CNNVD) 最新数据 → 写入 PostgreSQL → 调用 LLM 抽取受影响产品版本范围 → 同步至 Elasticsearch 供搜索。仅新增，不做更新/删除。
+全量（按需）或定时：爬取 (CVE / CNVD / CNNVD) 最新数据 → 写入 PostgreSQL → 调用 LLM 抽取受影响产品版本范围 → 同步至 Elasticsearch。新增单个源文件可通过 API 增量快速导入；历史补齐/再抽取走全量脚本。模式为追加，不做更新/删除。
 
 ## 系统架构
 ```
@@ -35,14 +35,14 @@ FastAPI (keyword / 条件搜索) 直接查 ES
 | db.py | 统一连接 + 初始化 schema/view |
 | CNNVD/, CNVD/, CVE/ | 各数据源 parser + ingest 脚本 |
 | llm_version_ranges.py | 批量调用 LLM 提取版本区间并写入 vuln_version_range |
-| pipeline_daily.py | 一键每日全流程：爬取→入库→LLM→ES 同步 |
+| pipeline_daily.py | 全量流程：爬取→入库→多轮 LLM→全量 ES 同步 |
 | search_db.py / search_es.py | 关键字 / 产品+版本 搜索 |
 | PROJECT_MANUAL.md | 更完整的设计/维护手册 |
 
 ## 数据库与索引
 表：cve / cnvd / cnnvd (结构相似) + vuln_version_range
-视图：merged_vulnerabilities_view 聚合三源并 LEFT JOIN 对应版本范围。
-ES 索引：vulnerabilities (嵌套字段 version_ranges)。
+视图：merged_vulnerabilities_view 聚合三源并生成统一 es_id；cve_id 简化为 COALESCE(cve.cve_id, cnvd.cvenumber, cnnvd.cve_id)。
+ES 索引：test_vulnerabilities (嵌套字段 version_ranges，默认名称，可自定义)。
 
 ## 运行方式
 ### 1. 安装依赖
@@ -54,18 +54,32 @@ pip install -r requirements.txt
 - Postgres 建库并提供连接 (PG_DSN)
 （pipeline_daily 会自动检测并创建 Elasticsearch 索引，无需手动脚本）
 
-### 3. 首次初始化 & 全量导入
+### 3. 全量导入（首次或周期性补齐）
 ```powershell
 python pipeline_daily.py
 ```
 (包含 schema 检查 / 爬取 / LLM / ES)
 
-### 4. 启动 API 服务
+### 4. 启动 API 服务（/search 与 /upload 增量导入）
 ```powershell
-uvicorn main:app --reload --port 8000
+uvicorn app:app --reload --port 8000
 ```
 
-### 5. 离线构建 / 无网环境部署
+### 5. 增量导入示例
+上传单文件并触发增量（单轮 LLM/ES 针对该文件）：
+```powershell
+curl -X POST "http://127.0.0.1:8000/upload?src=cve&mode=incremental" -F "file=@CVE_2025_08_14.json"
+```
+或用辅助脚本：
+```powershell
+python main.py --file CVE/data/2025-08-14.json --src cve
+```
+不传 --file 调用脚本即执行全量：
+```powershell
+python main.py
+```
+
+### 6. 离线构建 / 无网环境部署
 目标：目标服务器无外网，仅能接收打包文件或镜像。
 
 方式 A：直接传输已构建镜像
@@ -100,7 +114,7 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 |------|------|------|
 | PG_DSN | host=localhost port=5432 dbname=vul user=test password=test | PostgreSQL 连接串（或使用 db_config.ini） |
 | ES_URL / ES_HOST | http://localhost:9200 | Elasticsearch 地址 |
-| ES_INDEX | vulnerabilities | 索引名 |
+| ES_INDEX | test_vulnerabilities | 索引名 (默认 test_vulnerabilities) |
 | QWEN_COMPLETION_URL | (需配置) | LLM 接口地址 |
 | QWEN_MODEL | Qwen | 模型名 |
 | BATCH | 1000 | 单次 LLM 抽取批次查询上限 |
@@ -115,29 +129,29 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 | TEST_LIMIT | 20 | TEST_MODE 下样本条数 |
 | EXTRACTOR_VER | 1 | 版本抽取器版本号（用于跳过已处理数据） |
 | LLM_THREADS | 4 | pipeline 兼容参数（实际并发由 MAX_WORKERS/LLM_CONCURRENCY 控制） |
-| LOCK_TIMEOUT | 10 | pipeline 文件锁等待秒 |
-| LOCK_STALE_SECONDS | 3600 | 超过该秒数的旧锁视为陈旧并清理 |
+| (已移除锁相关变量) |  | pipeline 已不使用文件锁 |
 | VR_MAX_LOOPS | 5 | pipeline 中多轮 LLM 抽取最多循环次数 |
 | VR_STOP_ON_ZERO | true | 某轮 processed=0 时提前停止 |
 | ES_SKIP_IF_EMPTY | true | 当无文档需要写入时跳过 ES 同步 |
 
-## 每日自动流程 pipeline_daily
-1. 文件锁防并发（带陈旧锁清理）
-2. ensure_schema 创建表/视图
-3. 调用各 ingest_xxx 脚本（解析 → 入库，幂等 ON CONFLICT DO NOTHING）
-4. 多轮 LLM 抽取：循环调用 run_batch，直到：
-  - processed=0 且 VR_STOP_ON_ZERO=true，或
-  - 达到 VR_MAX_LOOPS 上限
-  每轮统计累积 (processed / failed / fallback_used / placeholders / retry_total)。
-5. 查询 merged_vulnerabilities_view 组装文档
-6. 若文档为空且 ES_SKIP_IF_EMPTY=true，跳过后续 ES；否则 ensure_index
-7. bulk upsert (doc_as_upsert) 生成 _id=source+source_id
-8. 汇总运行 JSON（包含多轮 details）
+## 全量流程 (pipeline_daily) 与 增量 (/upload)
+全量：
+1. ensure_schema
+2. ingest 三源（幂等追加）
+3. 多轮 LLM（VR_MAX_LOOPS / VR_STOP_ON_ZERO）
+4. 汇总视图全部文档 → ES upsert
+5. 输出 summary JSON
+
+增量：
+1. 单文件解析并入库
+2. mode=incremental → 针对该文件产生的 es_id 单轮 LLM + ES
+3. mode=full → 触发全量多轮（耗时）
+4. 返回插入与处理统计
 
 失败与健壮性：
-- LLM：多次重试 → 回退启发式 → 占位写入，保证每条最终有记录（或至少占位）。
-- ES：批量中单条失败计入 es_failed，不阻断整体。
-- pipeline 返回 status=partial 若存在 failed / es_failed>0。
+- LLM：重试 → 回退 → 占位。
+- ES：失败计数不阻断。
+- 全量 summary 标记 partial 若存在失败。
 
 ## LLM 版本范围抽取
 - 只处理 merged_vulnerabilities_view 中尚未达到当前 EXTRACTOR_VER 的 es_id
@@ -190,6 +204,6 @@ Q: 为什么会出现 placeholder 记录？
 A: 当 LLM 抽取与回退均无结果且 INSERT_PLACEHOLDER_ON_EMPTY=true，为保持数据完整性写入占位，以便后续统计；可在提升模型后提高 EXTRACTOR_VER 重新跑覆盖。
 
 Q: 如何新增新的漏洞源？
-A: 仿照现有目录结构：parser → ingest_xxx.py 调 insert_vulnerabilities；表结构加入 ensure_schema；视图扩展 UNION；ES 文档生成逻辑合并 source。
+A: 新增表 + parser + ingest_xxx.py；更新 ensure_schema & merged_vulnerabilities_view；ES 读取视图即可。
 
 更多细节参见 PROJECT_MANUAL.md。

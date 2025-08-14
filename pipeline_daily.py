@@ -1,20 +1,17 @@
 """每日漏洞数据流水线（增强版）。
 
 流程：
-    1. 获取文件锁（防并发，含陈旧锁清理）。
-    2. 确保数据库 schema 存在。
-    3. 采集三源数据（CVE / CNVD / CNNVD，幂等插入）。
-    4. 多轮 LLM 版本区间抽取（直到无新增或达到最大轮次）。
-    5. 全量（幂等 upsert）同步到 Elasticsearch 索引。
-    6. 输出汇总统计 JSON（含多轮细节）。
+    1. 确保数据库 schema 存在。
+    2. 采集三源数据（CVE / CNVD / CNNVD，幂等插入）。
+    3. 多轮 LLM 版本区间抽取（直到无新增或达到最大轮次）。
+    4. 全量（幂等 upsert）同步到 Elasticsearch 索引。
+    5. 输出汇总统计 JSON（含多轮细节）。
 
 核心环境变量：
     PG_DSN                 PostgreSQL 连接（可回退 db_config.ini）
     ES_URL                 Elasticsearch 地址 (默认 http://localhost:9200)
     ES_INDEX               索引名 (默认 vulnerabilities)
     LLM_THREADS            兼容占位（实际并发由 llm_version_ranges 控制）
-    LOCK_TIMEOUT           获取锁超时时间秒 (默认 10)
-    LOCK_STALE_SECONDS     陈旧锁判定阈值 (默认 3600)
     VR_MAX_LOOPS           LLM 抽取最大循环轮次 (默认 5)
     VR_STOP_ON_ZERO        某轮 processed=0 时提前停止 (默认 true)
     ES_SKIP_IF_EMPTY       没有文档时跳过 ES 同步 (默认 true)
@@ -27,7 +24,7 @@
 退出码：
     0 成功
     1 部分成功（存在 ingest 失败或 ES 部分失败等非致命问题）
-    2 致命失败（锁获取失败 / 未捕获异常）
+    2 致命失败（未捕获异常）
 """
 from __future__ import annotations
 
@@ -36,8 +33,6 @@ import sys
 import time
 import json
 import logging
-import hashlib
-import contextlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any
@@ -63,12 +58,9 @@ LOG = logging.getLogger('pipeline')
 ES_URL = os.getenv('ES_URL', 'http://localhost:9200')
 ES_INDEX = os.getenv('ES_INDEX', 'test_vulnerabilities')
 LLM_THREADS = int(os.getenv('LLM_THREADS', '4'))  # placeholder (actual concurrency inside module)
-LOCK_TIMEOUT = int(os.getenv('LOCK_TIMEOUT', '10'))
-LOCK_STALE_SECONDS = int(os.getenv('LOCK_STALE_SECONDS', '3600'))  # stale lock threshold
 VR_MAX_LOOPS = int(os.getenv('VR_MAX_LOOPS', '5'))
 VR_STOP_ON_ZERO = os.getenv('VR_STOP_ON_ZERO', 'true').lower() in ('1','true','yes','y')
 ES_SKIP_IF_EMPTY = os.getenv('ES_SKIP_IF_EMPTY', 'true').lower() in ('1','true','yes','y')
-LOCK_FILE = Path('pipeline_daily.lock')
 
 # Import ingestion routines dynamically (fallback if missing)
 def run_ingest(label: str, module_path: str) -> Dict[str, int]:
@@ -233,50 +225,13 @@ def _send_bulk(batch: List[Dict[str, Any]]):
             s += 1
     return s, f
 
-# Lock handling
-
-def acquire_lock() -> bool:
-    """尝试获得文件锁，支持检测/清理由崩溃遗留的陈旧锁。
-
-    逻辑：
-      - 常规尝试创建新文件 (O_EXCL)。
-      - 存在则检查修改时间；若超出 LOCK_STALE_SECONDS 视为陈旧并删除再试。
-      - 在等待窗口 (LOCK_TIMEOUT) 内持续轮询。"""
-    start = time.time()
-    while time.time() - start < LOCK_TIMEOUT:
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, 'w') as f:
-                f.write(str(os.getpid()))
-            LOG.info("Acquired lock %s", LOCK_FILE)
-            return True
-        except FileExistsError:
-            try:
-                stat = LOCK_FILE.stat()
-                age = time.time() - stat.st_mtime
-                if age > LOCK_STALE_SECONDS:
-                    LOG.warning("Stale lock (age %.0fs > %ss) detected, removing %s", age, LOCK_STALE_SECONDS, LOCK_FILE)
-                    with contextlib.suppress(Exception):
-                        LOCK_FILE.unlink()
-                    continue
-            except FileNotFoundError:
-                continue  # race 删除后重试
-            time.sleep(1)
-    return False
-
-def release_lock():
-    """释放文件锁（忽略不存在的情况）。"""
-    with contextlib.suppress(FileNotFoundError):
-        LOCK_FILE.unlink()
-        LOG.info("Released lock")
 
 
 def main():
-    """Entry point: lock → schema → ingest → multi-loop LLM → ES sync → summary."""
+    """Entry point: schema → ingest → multi-loop LLM → ES sync → summary.
+
+    说明：已移除文件锁；假设单进程运行。如需并发保护可在调度层控制。"""
     run_start = datetime.now(timezone.utc)
-    if not acquire_lock():
-        LOG.error("Could not acquire lock within %ss", LOCK_TIMEOUT)
-        sys.exit(2)
     partial = False
     try:
         ensure_schema()
@@ -304,29 +259,23 @@ def main():
         }
         for loop in range(1, VR_MAX_LOOPS + 1):
             loop_stats = llm_run_batch()
-            # Normalize keys if older version of module
             for k in list(loop_stats.keys()):
                 if k not in accumulated and k not in ('elapsed_sec',):
-                    # ignore unexpected keys in accumulation but keep in loop detail
                     pass
             for k in accumulated:
                 accumulated[k] += int(loop_stats.get(k, 0) or 0)
             llm_loops.append(loop_stats)
             LOG.info("LLM loop %d stats %s", loop, loop_stats)
-            # Early stop if no processed and configured to stop
             if VR_STOP_ON_ZERO and (loop_stats.get('processed', 0) == 0):
                 break
-            # Safety: if loop processed less than requested but still >0, continue until empty or max loops
         vr_stats = {
             'loops': len(llm_loops),
             'loops_detail': llm_loops,
             'accumulated': accumulated
         }
         if accumulated['failed'] > 0:
-            # Not fatal but mark partial
             partial = True
 
-        # ES sync (optional skip if empty)
         docs_iter = list(fetch_docs_for_es())
         if not docs_iter and ES_SKIP_IF_EMPTY:
             es_stats = {'es_success': 0, 'es_failed': 0, 'skipped': True}
@@ -346,7 +295,6 @@ def main():
             'status': 'partial' if partial else 'success'
         }
         LOG.info("SUMMARY %s", json.dumps(summary, ensure_ascii=False))
-        # Write JSON summary
         Path('log').mkdir(exist_ok=True)
         with open(f"log/pipeline_summary_{run_start.strftime('%Y%m%d_%H%M%S')}.json", 'w', encoding='utf-8') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -355,8 +303,117 @@ def main():
     except Exception:
         LOG.exception("Fatal pipeline error")
         sys.exit(2)
-    finally:
-        release_lock()
 
 if __name__ == '__main__':
     main()
+#############################################################
+# 增量同步（上传触发场景）
+#############################################################
+
+def _run_llm_multi_loop() -> dict:
+    """执行多轮 LLM 抽取（无锁，不做 ingestion），返回统计。供上传触发增量使用。"""
+    llm_loops: list[dict] = []
+    accumulated = {
+        'total_tasks': 0,
+        'processed': 0,
+        'skipped': 0,
+        'empty': 0,
+        'failed': 0,
+        'inserted_products': 0,
+        'fallback_used': 0,
+        'placeholders': 0,
+        'retry_total': 0,
+    }
+    for loop in range(1, VR_MAX_LOOPS + 1):
+        loop_stats = llm_run_batch()
+        for k in accumulated:
+            accumulated[k] += int(loop_stats.get(k, 0) or 0)
+        llm_loops.append(loop_stats)
+        LOG.info("[INCREMENTAL] LLM loop %d stats %s", loop, loop_stats)
+        if VR_STOP_ON_ZERO and (loop_stats.get('processed', 0) == 0):
+            break
+    return {
+        'loops': len(llm_loops),
+        'loops_detail': llm_loops,
+        'accumulated': accumulated
+    }
+
+def incremental_sync(run_llm: bool = True, es_sync: bool = True, mode: str = "incremental", es_ids: list[str] | None = None) -> dict:
+    """上传文件后调用：执行 LLM 抽取与 ES 同步。
+
+    参数:
+      mode: incremental | full
+        incremental: 仅对传入 es_ids 做 LLM 与 ES upsert；若 es_ids 为空则返回空。
+        full:       没有过滤，保持原全量行为。
+      es_ids: 新增/更新的 es_id 列表（仅 incremental 使用）。
+    """
+    vr_stats = {}
+    target_ids = es_ids if (mode == 'incremental') else None
+    if run_llm:
+        from llm_version_ranges import run_batch as _rb
+        if mode == 'incremental':
+            if not target_ids:
+                vr_stats = {'loops': 0, 'accumulated': {k:0 for k in ['total_tasks','processed','skipped','empty','failed','inserted_products','fallback_used','placeholders','retry_total']}}
+            else:
+                # 单轮即可：调用 run_batch only_es_ids
+                stats = _rb(only_es_ids=target_ids)
+                vr_stats = {
+                    'loops': 1,
+                    'loops_detail': [stats],
+                    'accumulated': {
+                        'total_tasks': stats.get('total_tasks',0),
+                        'processed': stats.get('processed',0),
+                        'skipped': stats.get('skipped',0),
+                        'empty': stats.get('empty',0),
+                        'failed': stats.get('failed',0),
+                        'inserted_products': stats.get('inserted_products',0),
+                        'fallback_used': stats.get('fallback_used',0),
+                        'placeholders': stats.get('placeholders',0),
+                        'retry_total': stats.get('retry_total',0)
+                    }
+                }
+        else:  # full
+            vr_stats = _run_llm_multi_loop()
+    es_stats = {}
+    if es_sync:
+        if mode == 'incremental':
+            if not target_ids:
+                es_stats = {'es_success': 0, 'es_failed': 0, 'skipped': True}
+            else:
+                # 仅取得指定 es_ids 文档
+                conn = get_conn()
+                docs = []
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT mv.*, COALESCE(json_agg(json_build_object(
+                            'product_id', r.product_id,
+                            'min_code', r.min_code,
+                            'max_code', r.max_code,
+                            'confidence', r.confidence,
+                            'version_text', r.version_text,
+                            'extractor_ver', r.extractor_ver
+                        ) ORDER BY r.product_id, r.min_code) FILTER (WHERE r.es_id IS NOT NULL), '[]') AS ranges
+                        FROM merged_vulnerabilities_view mv
+                        LEFT JOIN vuln_version_range r ON r.es_id = mv.es_id
+                        WHERE mv.es_id = ANY(%s)
+                        GROUP BY mv.es_id, mv.cve_id, mv.cnvd_number, mv.cnnvd_number, mv.description, mv.affected_products, mv.solution, mv.risk_display, mv.risk_level
+                    """, (target_ids,))
+                    rows = cur.fetchall()
+                for row in rows:
+                    doc = {k: row[k] for k in ["es_id", "cve_id", "cnvd_number", "cnnvd_number", "description", "affected_products", "solution", "risk_display", "risk_level"]}
+                    doc["version_ranges"] = row["ranges"]
+                    docs.append(doc)
+                ensure_index()
+                es_stats = bulk_upsert_es(docs)
+        else:
+            docs_iter = list(fetch_docs_for_es())
+            if not docs_iter and ES_SKIP_IF_EMPTY:
+                es_stats = {'es_success': 0, 'es_failed': 0, 'skipped': True}
+                LOG.info("[INCREMENTAL] Skip ES (no docs)")
+            else:
+                ensure_index()
+                es_stats = bulk_upsert_es(iter(docs_iter))
+    return {
+        'version_ranges': vr_stats,
+        'es': es_stats
+    }

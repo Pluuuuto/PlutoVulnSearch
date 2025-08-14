@@ -1,6 +1,6 @@
 # PlutoVulnSearch 项目手册
 
-版本：2025-08-14
+版本：2025-08-14 (修订：去除文件锁 / 增量模式说明 / 视图 cve_id 简化)
 
 ## 目录
 - [PlutoVulnSearch 项目手册](#plutovulnsearch-项目手册)
@@ -119,8 +119,9 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ### 3.5 视图 merged_vulnerabilities_view
 作用：合并三源，生成统一 es_id，聚合描述、产品、解决方案、风险等级。
-- es_id 生成策略：优先现成编号（CVE → CNVD → CNNVD）；都无则对描述拼接 MD5。
-- risk_level 统一标准：映射 CVSS 或中文严重级别到 0~4。
+- es_id：优先 CVE → CNVD → CNNVD，否则描述拼接 MD5。
+- cve_id：`UPPER(COALESCE(cve.cve_id, cnvd.cvenumber, cnnvd.cve_id))`。
+- risk_level：映射 CVSS / 中文严重级别至 0~4。
 
 ---
 ## 4. 主要模块说明
@@ -131,6 +132,11 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ### 4.2 各 ingestion 脚本 (CVE/ingest_cve.py 等)
 流程：扫描数据目录 → 解析文件 → 批量 insert (ON CONFLICT DO NOTHING) → 记录跳过与失败。
+
+说明：原先每个源目录下的 main.py 独立入口已移除，统一改为：
+- 日常批处理：使用根目录 `pipeline_daily.py`
+- 单源调试：直接运行对应 `ingest_*.py`（例如 `python CVE/ingest_cve.py`）
+- 外部文件批量导入：通过 FastAPI `/upload` 接口（app.py）上传 JSON/NDJSON。
 
 ### 4.3 llm_version_ranges.py
 核心：`run_batch()` 可复用，一次处理一批（BATCH 条）任务并返回统计。
@@ -161,41 +167,23 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 升级 / 重新抽取：当算法优化或模型升级时提升 `EXTRACTOR_VER`，旧 es_id 会再次成为候选，从而覆盖占位或低质量记录。
 
 ### 4.4 pipeline_daily.py
-日跑调度脚本：
-1. 获取文件锁（带陈旧锁清理：超过 `LOCK_STALE_SECONDS` 自动删除）
-2. ensure_schema (幂等创建表/视图)
-3. 三源 ingest（各自返回 inserted / skipped / failed）
-4. 多轮 LLM 抽取循环：
-  - 调用 `llm_run_batch()`（即 `run_batch()` 导入别名）收集一轮 stats
-  - 若本轮 `processed=0` 且 `VR_STOP_ON_ZERO=true` 则提前停止
-  - 最多进行 `VR_MAX_LOOPS` 轮
-  - 汇总 accumulated 统计与 per-loop detail
-5. 组装 ES 文档（视图查询）
-6. 若文档为空且 `ES_SKIP_IF_EMPTY=true`：跳过 ES；否则 ensure_index + bulk upsert (doc_as_upsert)
-7. 输出 summary JSON（含 loops_detail）
-8. 释放锁
+全量脚本（已移除文件锁，假设单实例）：
+1. ensure_schema
+2. ingest 三源
+3. 多轮 LLM（VR_MAX_LOOPS / VR_STOP_ON_ZERO）
+4. 组装全部视图文档 → ES upsert
+5. 输出 summary JSON
 
-退出码：
-- 0 success
-- 1 partial（任一源 ingest 失败条数>0 或 LLM 有 failed >0 或 ES 批量存在失败）
-- 2 fatal（无法获取锁 / 未捕获异常）
+退出码：0 success / 1 partial / 2 fatal（未捕获异常）。
 
 ### 4.5 search_es.py / search_db.py
 - search_es: nested 版本范围查询（产品 + 版本号落在区间）。
 - search_db: 关键词搜索封装（若未来加入 API）。
 
 ---
-## 5. 日常自动化流程 (pipeline_daily)
-增强版流程：
-1. acquire_lock（带陈旧锁回收）
-2. ensure_schema
-3. ingest 三源（幂等追加）
-4. 多轮 LLM 抽取（VR_MAX_LOOPS / VR_STOP_ON_ZERO 控制）
-5. 构建 ES 文档列表；若空且 ES_SKIP_IF_EMPTY=true 则跳过
-6. ensure_index（不存在时创建 mapping）
-7. bulk upsert（_id=es_id，幂等覆盖）
-8. 写 summary JSON（包含 version_ranges.loops_detail 与 accumulated）
-9. 释放锁
+## 5. 全量 vs 增量流程
+全量：见 4.4。适合作周期性补齐 / 再抽取。
+增量：FastAPI `/upload` 单文件导入；mode=incremental 仅对该文件对应 es_id 做单轮 LLM + ES；mode=full 触发全量多轮（耗时）。
 
 稳健性：LLM 保证每条最终有一条记录（真实或 placeholder），避免后续视图/映射断裂；失败统计不会中断主流程，除非为致命错误。
 
@@ -226,7 +214,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ---
 ## 7. Elasticsearch 索引与搜索
-索引：vulnerabilities
+索引：test_vulnerabilities（默认，可自定义）
 字段：
 - 基本元数据 (es_id, cve_id, cnvd_number, cnnvd_number, description, affected_products, solution, risk_display, risk_level)
 - version_ranges (nested): product_id / min_code / max_code / confidence / version_text / extractor_ver
@@ -257,7 +245,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 - ES 优化：ES_SKIP_IF_EMPTY 避免空跑
 
 健康检查：
-1. 每日 summary JSON 解析：比对 `version_ranges.accumulated.processed + skipped + empty + failed` == `version_ranges.accumulated.total_tasks`（若未来加 total_tasks 聚合）
+1. summary 中 processed / failed / empty 与 total_tasks（如提供）一致性
 2. 占位比例：placeholders / processed（过高表示模型效果差）
 3. 重试压力：retry_total / processed 平均值（>1 需关注）
 4. Fallback 使用率：fallback_used / processed（上升表示主 LLM 质量或稳定性下降）

@@ -1,4 +1,5 @@
 from elasticsearch import Elasticsearch
+from typing import List, Dict
 
 def parse_semver(s: str):
     if not s:
@@ -89,11 +90,41 @@ def search_vulnerabilities_by_product_version(es_host, index, product_name, vers
 
     return [hit["_source"] for hit in hits]
 
+
+def search_by_keyword(es_host: str, index: str, query: str, limit: int = 20) -> List[Dict]:
+    """基于 multi_match 的关键词搜索（description/affected_products/solution/version_ranges.version_text）。
+
+    参数:
+      es_host: ES 地址
+      index: 索引名
+      query: 关键词字符串
+      limit: 返回条数上限
+    返回: 文档 _source 列表
+    """
+    es = Elasticsearch(es_host)
+    body = {
+        "size": limit,
+        "query": {
+            "multi_match": {
+                "query": query,
+                "fields": [
+                    "description^2",
+                    "affected_products",
+                    "solution",
+                    "version_ranges.version_text"
+                ],
+                "type": "best_fields"
+            }
+        }
+    }
+    res = es.search(index=index, body=body)
+    return [h.get('_source', {}) for h in res.get('hits', {}).get('hits', [])]
+
 # 使用示例
 if __name__ == "__main__":
     results = search_vulnerabilities_by_product_version(
         es_host="http://localhost:9200",
         index="test_vulnerabilities",
-        product_name="wordpress",
-        version_str="22.0"
+        product_name="PowerScale OneFS",
+        version_str="9.4.1"
     )

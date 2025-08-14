@@ -8,4 +8,3 @@ CNVD/data/
 CNVD/log/
 CVE/data/
 CVE/log/
-pipeline_daily.lock

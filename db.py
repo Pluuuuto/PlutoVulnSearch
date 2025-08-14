@@ -94,7 +94,7 @@ BASE_TABLE_DDL = [  # 按顺序执行的 DDL 语句列表（幂等）
     "CREATE INDEX IF NOT EXISTS idx_vr_range ON vuln_version_range(min_code, max_code);",
 ]
 
-MERGED_VIEW_SQL = """-- 融合视图：按优先级(cve->cnvd->cnnvd) 组合统一漏洞 ID 与字段
+MERGED_VIEW_SQL = """-- 融合视图：按优先级(cve->cnvd->cnnvd) 组合统一漏洞 ID 与字段（cve_id 简化：直接取 cve.cve_id -> cnvd.cvenumber -> cnnvd.cve_id）
 CREATE OR REPLACE VIEW merged_vulnerabilities_view AS
 SELECT DISTINCT ON (
     COALESCE(UPPER(cve.cve_id), UPPER(cnvd.cnvd_number), UPPER(cnnvd.vuln_id))
@@ -105,7 +105,7 @@ SELECT DISTINCT ON (
         UPPER(cnnvd.vuln_id),
         md5(COALESCE(cve.vuln_description,'') || COALESCE(cnvd.description,'') || COALESCE(cnnvd.vuln_descript,''))
     ) AS es_id,
-    UPPER(cve.cve_id) AS cve_id,
+    UPPER(COALESCE(cve.cve_id, cnvd.cvenumber, cnnvd.cve_id)) AS cve_id,
     cnvd.cnvd_number,
     cnnvd.vuln_id AS cnnvd_number,
     CONCAT_WS('; ', NULLIF(cve.vuln_description,''), NULLIF(cnvd.description,''), NULLIF(cnnvd.vuln_descript,'')) AS description,
@@ -138,7 +138,7 @@ SELECT DISTINCT ON (
         UPPER(cnnvd.vuln_id),
         md5(COALESCE(cnvd.description,'') || COALESCE(cnnvd.vuln_descript,''))
     ) AS es_id,
-    NULL AS cve_id,
+    UPPER(COALESCE(cnvd.cvenumber, cnnvd.cve_id)) AS cve_id,
     cnvd.cnvd_number,
     cnnvd.vuln_id AS cnnvd_number,
     CONCAT_WS('; ', NULLIF(cnvd.description,''), NULLIF(cnnvd.vuln_descript,'')) AS description,
