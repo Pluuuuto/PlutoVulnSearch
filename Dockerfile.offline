@@ -1,0 +1,33 @@
+## Offline-ready Dockerfile
+# 使用场景：目标机器无法访问外网（不能 pip 下载），但可以接收完整源码 + 依赖 wheel 文件或已构建镜像。
+# 前置步骤（在有网环境执行）：
+#   1. mkdir wheels
+#   2. pip download -r requirements.txt -d wheels
+#   3. (可选) 将 wheels 目录打包或直接跟随源码一起传输
+#   4. 使用此 Dockerfile 构建镜像（离线环境不再访问外网）
+
+FROM python:3.10-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PG_DSN="host=pg01 port=5432 dbname=test user=test password=test" \
+    ES_URL="http://pg01:9200" \
+    ES_INDEX="test_vulnerabilities"
+
+WORKDIR /app
+
+# 复制依赖 wheel 包与 requirements.txt
+COPY requirements.txt ./
+COPY wheels/ ./wheels/
+
+# 离线安装：禁止访问 PyPI，仅使用本地 wheels
+RUN pip install --no-index --find-links=./wheels -r requirements.txt \
+    && rm -rf /root/.cache/pip
+
+# 复制源码
+COPY . .
+
+EXPOSE 8000
+
+# 缺省启动 API（可改为 pipeline_daily.py）
+CMD ["tail", "-f", "/dev/null"]

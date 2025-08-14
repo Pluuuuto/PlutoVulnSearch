@@ -1,27 +1,33 @@
-"""Daily vulnerability data pipeline.
+"""每日漏洞数据流水线（增强版）。
 
-Steps:
-  1. Acquire lock (file based) to prevent concurrent runs.
-  2. Ensure DB schema.
-  3. Ingest sources (CVE, CNVD, CNNVD).
-  4. Extract version ranges (LLM) for new es_id without ranges.
-  5. Sync (full upsert) to Elasticsearch.
-  6. Output summary metrics.
+流程：
+    1. 获取文件锁（防并发，含陈旧锁清理）。
+    2. 确保数据库 schema 存在。
+    3. 采集三源数据（CVE / CNVD / CNNVD，幂等插入）。
+    4. 多轮 LLM 版本区间抽取（直到无新增或达到最大轮次）。
+    5. 全量（幂等 upsert）同步到 Elasticsearch 索引。
+    6. 输出汇总统计 JSON（含多轮细节）。
 
-Environment variables:
-  PG_DSN        PostgreSQL DSN, or configured in db_config.ini if unset
-  ES_URL        Elasticsearch base URL (default http://localhost:9200)
-  ES_INDEX      Target index name (default vulnerabilities)
-  LLM_THREADS   Thread pool size for version range extraction (default 4)
-  LOCK_TIMEOUT  Seconds to wait before giving up acquiring lock (default 10)
+核心环境变量：
+    PG_DSN                 PostgreSQL 连接（可回退 db_config.ini）
+    ES_URL                 Elasticsearch 地址 (默认 http://localhost:9200)
+    ES_INDEX               索引名 (默认 vulnerabilities)
+    LLM_THREADS            兼容占位（实际并发由 llm_version_ranges 控制）
+    LOCK_TIMEOUT           获取锁超时时间秒 (默认 10)
+    LOCK_STALE_SECONDS     陈旧锁判定阈值 (默认 3600)
+    VR_MAX_LOOPS           LLM 抽取最大循环轮次 (默认 5)
+    VR_STOP_ON_ZERO        某轮 processed=0 时提前停止 (默认 true)
+    ES_SKIP_IF_EMPTY       没有文档时跳过 ES 同步 (默认 true)
 
-Idempotence:
-  - DB inserts use ON CONFLICT DO NOTHING (append-only).
-  - Version range extraction only processes es_id not present in vuln_version_range.
-  - ES sync overwrites (doc_as_upsert) so repeated runs are safe.
+幂等性：
+    - 数据采集：ON CONFLICT DO NOTHING 追加。
+    - LLM 抽取：仅处理当前 extractor_ver 未覆盖的 es_id，多轮迅速收敛。
+    - ES 同步：按 _id 覆盖（upsert）。
 
-Exit codes:
-  0 success, 1 partial (some non-critical failures), 2 fatal.
+退出码：
+    0 成功
+    1 部分成功（存在 ingest 失败或 ES 部分失败等非致命问题）
+    2 致命失败（锁获取失败 / 未捕获异常）
 """
 from __future__ import annotations
 
@@ -56,9 +62,12 @@ LOG = logging.getLogger('pipeline')
 
 ES_URL = os.getenv('ES_URL', 'http://localhost:9200')
 ES_INDEX = os.getenv('ES_INDEX', 'test_vulnerabilities')
-LLM_THREADS = int(os.getenv('LLM_THREADS', '4'))
+LLM_THREADS = int(os.getenv('LLM_THREADS', '4'))  # placeholder (actual concurrency inside module)
 LOCK_TIMEOUT = int(os.getenv('LOCK_TIMEOUT', '10'))
-LOCK_STALE_SECONDS = int(os.getenv('LOCK_STALE_SECONDS', '3600'))  # 超过此秒认为陈旧锁可被清理
+LOCK_STALE_SECONDS = int(os.getenv('LOCK_STALE_SECONDS', '3600'))  # stale lock threshold
+VR_MAX_LOOPS = int(os.getenv('VR_MAX_LOOPS', '5'))
+VR_STOP_ON_ZERO = os.getenv('VR_STOP_ON_ZERO', 'true').lower() in ('1','true','yes','y')
+ES_SKIP_IF_EMPTY = os.getenv('ES_SKIP_IF_EMPTY', 'true').lower() in ('1','true','yes','y')
 LOCK_FILE = Path('pipeline_daily.lock')
 
 # Import ingestion routines dynamically (fallback if missing)
@@ -263,7 +272,7 @@ def release_lock():
 
 
 def main():
-    """日常全流程入口：锁→建表→三源导入→LLM 区间→ES 同步→汇总输出。"""
+    """Entry point: lock → schema → ingest → multi-loop LLM → ES sync → summary."""
     run_start = datetime.now(timezone.utc)
     if not acquire_lock():
         LOG.error("Could not acquire lock within %ss", LOCK_TIMEOUT)
@@ -280,12 +289,53 @@ def main():
         if any(v['failed'] == -1 for v in ingest_stats.values()):
             partial = True
 
-        vr_stats = llm_run_batch()
-
-        ensure_index()
-        es_stats = bulk_upsert_es(fetch_docs_for_es())
-        if es_stats['es_failed'] > 0:
+        # Multi-loop LLM extraction (accumulate stats)
+        llm_loops: list[dict] = []
+        accumulated = {
+            'total_tasks': 0,
+            'processed': 0,
+            'skipped': 0,
+            'empty': 0,
+            'failed': 0,
+            'inserted_products': 0,
+            'fallback_used': 0,
+            'placeholders': 0,
+            'retry_total': 0,
+        }
+        for loop in range(1, VR_MAX_LOOPS + 1):
+            loop_stats = llm_run_batch()
+            # Normalize keys if older version of module
+            for k in list(loop_stats.keys()):
+                if k not in accumulated and k not in ('elapsed_sec',):
+                    # ignore unexpected keys in accumulation but keep in loop detail
+                    pass
+            for k in accumulated:
+                accumulated[k] += int(loop_stats.get(k, 0) or 0)
+            llm_loops.append(loop_stats)
+            LOG.info("LLM loop %d stats %s", loop, loop_stats)
+            # Early stop if no processed and configured to stop
+            if VR_STOP_ON_ZERO and (loop_stats.get('processed', 0) == 0):
+                break
+            # Safety: if loop processed less than requested but still >0, continue until empty or max loops
+        vr_stats = {
+            'loops': len(llm_loops),
+            'loops_detail': llm_loops,
+            'accumulated': accumulated
+        }
+        if accumulated['failed'] > 0:
+            # Not fatal but mark partial
             partial = True
+
+        # ES sync (optional skip if empty)
+        docs_iter = list(fetch_docs_for_es())
+        if not docs_iter and ES_SKIP_IF_EMPTY:
+            es_stats = {'es_success': 0, 'es_failed': 0, 'skipped': True}
+            LOG.info("ES sync skipped (no documents) ES_SKIP_IF_EMPTY=%s", ES_SKIP_IF_EMPTY)
+        else:
+            ensure_index()
+            es_stats = bulk_upsert_es(iter(docs_iter))
+            if es_stats['es_failed'] > 0:
+                partial = True
 
         summary = {
             'run_start': run_start.isoformat(),

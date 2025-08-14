@@ -60,6 +60,9 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))             # 线程数
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))     # 同时进行的 LLM 调用数上限（可小于 MAX_WORKERS）
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))  # 单次 LLM 请求超时秒
 ENABLE_FALLBACK = os.getenv("ENABLE_FALLBACK", "true").lower() in ("1","true","yes","y")  # LLM 失败/空结果时启用简易回退提取
+LLM_RETRIES = int(os.getenv("LLM_RETRIES", "2"))             # LLM 失败或空结果时额外重试次数（不含首次）
+LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "1.5"))  # 重试指数退避基数
+INSERT_PLACEHOLDER_ON_EMPTY = os.getenv("INSERT_PLACEHOLDER_ON_EMPTY", "true").lower() in ("1","true","yes","y")
 
 # 模式
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1","true","yes","y")
@@ -348,57 +351,97 @@ def upsert_ranges(conn, es_id: str, src_text: str, products: List[Dict[str,Any]]
 
 # ====================== 工作线程 ======================
 def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str, Any]:
-    """处理单任务：去重检查→LLM 调用→写库→返回统计字段。"""
-    """处理单条：去重检查 → 调 LLM → 写库。返回结果字典用于统计。"""
-    es_id = task["es_id"]; text = task["affected_products"] or ""
-    conn = None
-    try:
-        conn = pool.getconn()
-        # 去重（断点续跑）
-        with conn.cursor() as c2:
-            c2.execute("""
-              SELECT 1 FROM vuln_version_range
-               WHERE es_id=%s AND extractor_ver >= %s
-               LIMIT 1
-            """, (es_id, EXTRACTOR_VER))
-            if c2.fetchone():
-                return {"es_id": es_id, "skipped": True}
+        """处理单条：去重检查 → LLM 多次尝试 → 回退 → （可选占位写入） → 写库。
 
-        # 调 LLM
-        products: List[Dict[str, Any]] = []
-        llm_error = None
+        返回字段：
+            es_id, inserted, count, skipped, empty, error, fallback(bool), placeholder(bool), retries(int)
+        """
+        es_id = task["es_id"]
+        text = task["affected_products"] or ""
+        conn = None
         try:
-            result = call_llm(text)
-            products = result.get("products") or []
-        except Exception as le:
-            llm_error = str(le)
-            logger.warning(f"LLM 调用失败 es_id={es_id}: {llm_error}")
+            conn = pool.getconn()
+            # 去重（断点续跑）
+            with conn.cursor() as c2:
+                c2.execute("""
+                  SELECT 1 FROM vuln_version_range
+                   WHERE es_id=%s AND extractor_ver >= %s
+                   LIMIT 1
+                """, (es_id, EXTRACTOR_VER))
+                if c2.fetchone():
+                    return {"es_id": es_id, "skipped": True}
 
-        # 回退：LLM 失败或无结果且启用回退
-        if ENABLE_FALLBACK and (llm_error or not products):
-            fb = fallback_extract(text)
-            if fb:
-                logger.info(f"启用回退抽取 es_id={es_id} products={len(fb)} (llm_error={bool(llm_error)})")
-                products = fb
+            products: List[Dict[str, Any]] = []
+            llm_error: str | None = None
+            attempts = 0
+            max_attempts = 1 + max(0, LLM_RETRIES)
+            while attempts < max_attempts:
+                attempts += 1
+                try:
+                    result = call_llm(text)
+                    products = result.get("products") or []
+                    if products:
+                        break
+                    llm_error = "empty_products"
+                    logger.debug(f"LLM 空结果 es_id={es_id} attempt={attempts}/{max_attempts}")
+                except Exception as le:
+                    llm_error = str(le)
+                    logger.warning(f"LLM 调用失败 es_id={es_id} attempt={attempts}/{max_attempts}: {llm_error}")
+                if attempts < max_attempts:
+                    backoff = round(LLM_RETRY_BACKOFF_BASE ** (attempts-1), 2)
+                    time.sleep(min(backoff, 10))
 
-        # 写库
-        if products:
-            upsert_ranges(conn, es_id, text, products)
-            conn.commit()
-            return {"es_id": es_id, "inserted": True, "count": len(products)}
-        else:
-            # 无抽取也记个空结果的 info（不写库）
-            return {"es_id": es_id, "empty": True}
-    except Exception as e:
-        if conn:
-            try: conn.rollback()
-            except: pass
-        logger.error(f"处理失败 es_id={es_id} - {e}")
-        logger.debug(traceback.format_exc())
-        return {"es_id": es_id, "error": str(e)}
-    finally:
-        if conn:
-            pool.putconn(conn)
+            used_fallback = False
+            used_placeholder = False
+            if ENABLE_FALLBACK and (llm_error or not products):
+                fb = fallback_extract(text)
+                if fb:
+                    logger.info(f"启用回退抽取 es_id={es_id} products={len(fb)} (llm_error={bool(llm_error)})")
+                    products = fb
+                    used_fallback = True
+
+            if not products and INSERT_PLACEHOLDER_ON_EMPTY:
+                products = [{
+                    "product_id": "placeholder",
+                    "items": [{"type": "eq", "versions": ["0.0.0"]}],
+                    "confidence": 0.0
+                }]
+                used_placeholder = True
+                logger.info(f"占位写入 es_id={es_id} (placeholder) 以保证落库")
+
+            if products:
+                try:
+                    upsert_ranges(conn, es_id, text, products)
+                    conn.commit()
+                    return {
+                        "es_id": es_id,
+                        "inserted": True,
+                        "count": len(products),
+                        "fallback": used_fallback,
+                        "placeholder": used_placeholder,
+                        "retries": attempts-1
+                    }
+                except Exception as we:
+                    if conn:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    logger.error(f"写入失败 es_id={es_id}: {we}")
+                    return {"es_id": es_id, "error": str(we), "retries": attempts-1}
+            return {"es_id": es_id, "empty": True, "retries": attempts-1}
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error(f"处理失败 es_id={es_id} - {e}")
+            logger.debug(traceback.format_exc())
+            return {"es_id": es_id, "error": str(e)}
+        finally:
+            if conn:
+                pool.putconn(conn)
 
 # ====================== 主流程 ======================
 def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
@@ -463,6 +506,9 @@ def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
     logger.info(f"本批待处理: {len(tasks)} 条，线程: {MAX_WORKERS}，LLM并发: {LLM_CONCURRENCY}")
 
     ok, skip, empty, err, prod_total = 0, 0, 0, 0, 0
+    fb_cnt = 0
+    ph_cnt = 0
+    retry_total = 0
     started = time.time()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         future_map = {ex.submit(worker, t, pool): t for t in tasks}
@@ -472,7 +518,18 @@ def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
             if res.get("inserted"):
                 ok += 1
                 prod_total += int(res.get('count') or 0)
-                logger.info(f"✅ 写入完成 {es_id}（products={res.get('count')})")
+                retry_total += int(res.get('retries') or 0)
+                if res.get("fallback"):
+                    fb_cnt += 1
+                if res.get("placeholder"):
+                    ph_cnt += 1
+                tag = []
+                if res.get("fallback"): tag.append("fallback")
+                if res.get("placeholder"): tag.append("placeholder")
+                if res.get('retries'):
+                    tag.append(f"retries={res.get('retries')}")
+                tag_str = (" " + ",".join(tag)) if tag else ""
+                logger.info(f"✅ 写入完成 {es_id}（products={res.get('count')}){tag_str}")
             elif res.get("skipped"):
                 skip += 1
                 logger.debug(f"跳过已处理 {es_id}")
@@ -491,7 +548,10 @@ def run_batch(test_mode: bool | None = None, batch: int | None = None) -> dict:
         'empty': empty,
         'failed': err,
         'inserted_products': prod_total,
-        'elapsed_sec': round(elapsed, 3)
+    'elapsed_sec': round(elapsed, 3),
+    'fallback_used': fb_cnt,
+    'placeholders': ph_cnt,
+    'retry_total': retry_total
     }
     logger.info("批次完成统计 %s", stats)
 

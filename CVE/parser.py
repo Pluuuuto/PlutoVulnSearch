@@ -1,6 +1,5 @@
 import json
 import re
-from deep_translator import GoogleTranslator
 
 def parse_vulnerabilities(json_path):
     with open(json_path, 'r', encoding='utf-8') as f:

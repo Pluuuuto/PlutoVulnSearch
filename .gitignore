@@ -5,7 +5,10 @@
 /CVE/data
 /CVE/log
 /log
+/wheels
 __pycache__/
 */__pycache__/
 *.pyc
 pipeline_daily.lock
+*.tar
+*.tgz

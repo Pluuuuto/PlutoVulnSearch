@@ -3,4 +3,3 @@ uvicorn
 psycopg2-binary
 elasticsearch
 requests
-deep-translator
