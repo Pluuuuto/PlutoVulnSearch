@@ -1,6 +1,6 @@
 # PlutoVulnSearch 项目手册
 
-版本：2025-08-14 (修订：统一遍历模式 / 去除 run_batch & 多轮变量 / 去除文件锁 / 视图 cve_id 简化)
+版本：2025-08-15 (修订：统一遍历模式→默认补齐缺失 skip-existing / 去除 run_batch & 多轮变量 / 去除文件锁 / 视图 cve_id 简化)
 
 ## 目录
 - [PlutoVulnSearch 项目手册](#plutovulnsearch-项目手册)
@@ -20,7 +20,8 @@
     - [4.4 pipeline\_daily.py](#44-pipeline_dailypy)
     - [4.5 search\_es.py / search\_db.py](#45-search_espy--search_dbpy)
   - [5. 全量 vs 增量流程](#5-全量-vs-增量流程)
-  - [6. LLM 版本区间抽取设计（统一遍历）](#6-llm-版本区间抽取设计统一遍历)
+  - [6. LLM 版本区间抽取设计（统一遍历，补齐模式）](#6-llm-版本区间抽取设计统一遍历补齐模式)
+    - [6.1 回退 (fallback) 与 占位 (placeholder) 判定规则补充](#61-回退-fallback-与-占位-placeholder-判定规则补充)
   - [7. Elasticsearch 索引与搜索](#7-elasticsearch-索引与搜索)
   - [8. 代码规范与约定](#8-代码规范与约定)
   - [9. 运维与部署建议](#9-运维与部署建议)
@@ -141,34 +142,33 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 ### 4.3 llm_version_ranges.py
 统一单入口：`run_all_exhaustive(batch=None, progress_every=..., only_es_ids=None)`。
 
-模式说明：
-- 全量：`only_es_ids=None` 时循环抓取批次（大小取 BATCH env）直至没有未达当前 `EXTRACTOR_VER` 的 es_id。
-- 增量：`only_es_ids=[...]` 限定集合处理（若已是最新版本则跳过），用于外部上传触发的局部刷新。
+当前默认策略：补齐缺失 (skip-existing)。
+- 全量：`only_es_ids=None` 仅抓取“尚未在 vuln_version_range 出现”的 es_id；已有记录跳过，不重复 LLM 调用。
+- 增量：`only_es_ids=[...]` 对集合内再做缺失过滤，已有记录跳过。
 
-并发与控制：
-- 线程池大小：`MAX_WORKERS`
-- LLM 并发：`LLM_CONCURRENCY`（BoundedSemaphore）
-- 批内进度：每完成 `INTRA_BATCH_LOG_EVERY` 条输出一行；若超过 `HEARTBEAT_SEC` 秒无完成事件输出心跳（包含累计完成/剩余估计）。
+强制重抽：手动删除目标 es_id 在 vuln_version_range 中的记录后再运行；未来可加入 `FORCE_FULL=1` 环境变量回退到全量重建模式。
+
+并发与控制：MAX_WORKERS / LLM_CONCURRENCY / INTRA_BATCH_LOG_EVERY / HEARTBEAT_SEC 保持不变。
 
 处理流水（单任务 worker）：
-1. 读取原始 affected_products 文本（视图字段统一名称）。
-2. LLM JSON 抽取（失败/空触发重试；重试次数 = 1 + `LLM_RETRIES`）。
-3. 全部失败或仍空 → 可选回退：启用 `ENABLE_FALLBACK` 时基于 regex 拆出 eq 版本。
-4. 仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY=true` → 占位记录：`product_id=placeholder, version=0.0.0, confidence=0`。
-5. 归并：`items_to_intervals()` 得到规范区间 (min_code,max_code) 与 version_text。
-6. 写入：先 DELETE 该 es_id 旧记录，再批量 INSERT（带 `extractor_ver`）。
+1. 读取 affected_products。
+2. LLM 抽取 + 重试 (1 + LLM_RETRIES)。
+3. 失败或空 → 回退 (ENABLE_FALLBACK)。
+4. 仍空 → 占位 (INSERT_PLACEHOLDER_ON_EMPTY)。
+5. 区间归并：items_to_intervals。
+6. 写入：直接 INSERT（缺失补齐不需 DELETE）。
 
-版本编码：`a*1e9 + b*1e6 + c*1e3 + d` 支持最多四段（含 u → 0 处理）。
+版本编码：`a*1e9 + b*1e6 + c*1e3 + d`；含 `u` 形式按规则编码。
 
-统计（run_all_exhaustive 返回）：`total_tasks, processed, skipped, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec`。
+统计返回：`total_tasks, processed, skipped_existing, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec`。
 
-再抽取：提升 `EXTRACTOR_VER` 即可让全部（含 placeholder）重新进入候选，覆盖老版本输出。
+再抽取：EXTRACTOR_VER 仅做标记，不触发自动重跑；需重跑先删记录或未来启用 FORCE_FULL。
 
 ### 4.4 pipeline_daily.py
 全量脚本（无文件锁，假设单实例）：
 1. ensure_schema
 2. ingest 三源
-3. 统一遍历 LLM（单次 run_all_exhaustive 覆盖全部待处理）
+3. run_all_exhaustive 补齐缺失（不重写已有）
 4. 组装全部视图文档 → ES upsert
 5. 输出 summary JSON
 
@@ -180,39 +180,45 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ---
 ## 5. 全量 vs 增量流程
-全量：`run_all_exhaustive()` 覆盖所有未达当前 `EXTRACTOR_VER` 的 es_id。
-增量：上传文件后解析得到受影响 es_id 列表，调用 `run_all_exhaustive(only_es_ids=...)`；随后仅对这些 ID 进行 ES upsert。
-稳健性：任何 es_id 最终至少 1 条记录（真实或 placeholder），保持 ES 文档 version_ranges 数组存在，利于统计与查询统一。
+全量补齐：`run_all_exhaustive()` 只处理缺失的 es_id（跳过已有）。
+增量补齐：上传文件 → 解析出 es_id → 对该列表执行缺失补齐。
+刷新策略：不再自动“删除+重写”；若需刷新某些 es_id，手动删除其记录后再运行。
+占位：首次进入的 es_id 至少 1 条记录（真实或 placeholder）。
 
 ---
-## 6. LLM 版本区间抽取设计（统一遍历）
+## 6. LLM 版本区间抽取设计（统一遍历，补齐模式）
 输入：`affected_products` 原始产品与版本描述（多源字段标准化后的汇总）。
 输出：标准 JSON（products 数组）。`items` 支持类型：`lt/lte/gt/gte/eq/range/wildcard/list`。
 
 处理流水：
-1. 任务筛选：按 `EXTRACTOR_VER` 过滤，确保升级后可重新处理旧数据。
+1. 任务抓取：批次遍历缺失 es_id（或限定集合后过滤缺失）；已有记录不进入任务队列。
 2. LLM 调用：Qwen 接口；失败 / 非 200 / 解析异常 → 触发重试。
 3. 重试：最多 1 + LLM_RETRIES 次；指数退避；空 products 也算重试触发条件。
-4. 回退：启用 `ENABLE_FALLBACK` 时对文本进行启发式拆分与版本正则抽取，生成 eq items。
-5. 占位：若仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY` 为 true，写 placeholder 记录（product_id=placeholder, version=0.0.0）
+4. 回退：启用 `ENABLE_FALLBACK` 时对文本进行启发式拆分与版本正则抽取，生成低置信度 eq / wildcard items。
+5. 占位：若仍无结果且 `INSERT_PLACEHOLDER_ON_EMPTY` 为 true，写 placeholder 记录（product_id=placeholder, version=0.0.0）。
 6. 区间合并：`items_to_intervals()` 解析为离散区间 + 可读 `version_text`。
-7. 写入：删除旧 es_id → UPSERT 每个区间；含 `extractor_ver` 以支持后续升级。
+7. 写入：直接 INSERT（缺失补齐不涉及 DELETE）。
 
-简化记忆：回退=“粗糙猜测一些真实版本”（低置信度避免空白）；占位=“放一块砖保证有结构”，两者都在下次版本升级时被覆盖。
+简化：回退 = “尽量给可能真实的版本列表（低置信度）”；占位 = “保证结构统一”。
 
-占位意义：保证下游 ES 文档嵌套结构存在 version_ranges 数组元素，便于统计“覆盖率”；未来提升 `EXTRACTOR_VER` 后会被覆盖。
+占位意义：确保 ES 文档 version_ranges 数组存在，便于统计覆盖率；后续手动清理 + 重跑可替换占位。
+
+### 6.1 回退 (fallback) 与 占位 (placeholder) 判定规则补充
+
+| 情形 | 触发条件 | 产生内容 | 典型原因 | 处理策略 |
+|------|----------|----------|----------|----------|
+| 正常 LLM 输出 | LLM 返回 products 且有 items | 直接解析写入 | 文本含清晰版本模式 | — |
+| 回退 (fallback) | LLM 多次失败/异常 或 返回空 且 ENABLE_FALLBACK=true | 正则/启发式提取 1.2.3 / 5.6 / 7u45 / 8.x 等，生成 eq/wildcard items，低置信度 | 简单格式或 LLM 不稳定 | 给出候选，后续再覆盖 |
+| 占位 (placeholder) | LLM 与回退都空 且 INSERT_PLACEHOLDER_ON_EMPTY=true | product_id=placeholder, 0.0.0 | 无版本号/泛描述 | 保证有结构，可后来重跑 |
+
+示例：`"php php"` 无真实版本；已在回退阶段过滤纯字母短 token，避免历史上出现的 `invalid literal for int()` 日志；仍无版本 → 占位。
 
 统计指标：
-- processed / failed / empty / skipped
-- fallback_used（使用回退的任务数）
-- placeholders（写入占位的任务数）
-- retry_total（总重试次数）
-- inserted_products（写入的产品条目数聚合）
-- inserted_rows（最终写入区间行数）
-- batches（批次数）
-- elapsed_sec（总耗时秒）
+- processed / failed / empty / skipped_existing
+- fallback_used / placeholders / retry_total
+- inserted_products / inserted_rows / batches / elapsed_sec
 
-再抽取策略：提升 `EXTRACTOR_VER` → 全量重新纳入任务（包含 placeholder），保证覆盖低质量历史结果。
+再抽取策略：默认不重写；需重跑删除记录或未来 FORCE_FULL；EXTRACTOR_VER 用于结果分析与对比。
 
 ---
 ## 7. Elasticsearch 索引与搜索
@@ -223,71 +229,72 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 查询：
 - 产品+版本：nested + range(min_code<=code<=max_code)
 - 关键词：可添加 multi_match(description, affected_products, solution)
-索引构建：pipeline_daily.ensure_index() 在不存在时创建 mapping（已替代旧 generate_index.py 脚本）。
+索引构建：pipeline_daily.ensure_index() 不存在时创建 mapping。
 更新策略：bulk index 覆盖（_id=es_id）。
 
 ---
 ## 8. 代码规范与约定
 - 统一入口：pipeline_daily.py
 - 数据追加：不更新历史行（无 updated_at）。
-- 表/字段名：保持现有大小写（PostgreSQL 非带引号会折叠为小写）。
+- 表/字段名：保持现有大小写。
 - 日志：模块独立日志 + pipeline 汇总 JSON。
 - 并发：线程池 + 连接池 (llm_version_ranges)。
-- 异常：捕获后分类为 partial 或 fatal。
+- 异常：分类为 partial 或 fatal。
 
 ---
 ## 9. 运维与部署建议
 调度：Windows 任务计划程序 / cron（Linux）。
 
-db_config.ini 约定（统一）：
+db_config.ini 约定：
 ```
 [postgresql]
 host=127.0.0.1
 port=5432
-dbname=YOUR_DB   # 必须使用 dbname 关键字；不再支持 database 别名
+dbname=YOUR_DB
 user=xxx
 password=xxx
 ```
 
-关键环境变量（补充）：
+关键环境变量：
 - 重试相关：LLM_RETRIES, LLM_RETRY_BACKOFF_BASE
 - 回退 / 占位：ENABLE_FALLBACK, INSERT_PLACEHOLDER_ON_EMPTY
-- 版本迭代：EXTRACTOR_VER（升级算法后递增）
+- 版本迭代：EXTRACTOR_VER
 - 批次与并发：BATCH, MAX_WORKERS, LLM_CONCURRENCY
 - 批内日志：INTRA_BATCH_LOG_EVERY, HEARTBEAT_SEC
-- ES 优化：ES_SKIP_IF_EMPTY 避免空跑
+- ES 优化：ES_SKIP_IF_EMPTY
 
 健康检查：
-1. summary 中 processed / failed / empty 与 total_tasks（如提供）一致性
-2. 占位比例：placeholders / processed（过高表示模型效果差）
-3. 重试压力：retry_total / processed 平均值（>1 需关注）
-4. Fallback 使用率：fallback_used / processed（上升表示主 LLM 质量或稳定性下降）
-5. ES 文档计数 vs merged_vulnerabilities_view COUNT(*)（差距代表漏同步）
+1. 占位比例 placeholders/processed
+2. 回退使用率 fallback_used/processed
+3. retry_total/processed 平均值
+4. ES 文档计数 vs 视图 COUNT(*)
+5. 插入速度与批次数量趋势
 
 备份：
-- PostgreSQL：逻辑备份 (pg_dump) + 定期校验
-- ES：注册快照仓库（如使用）
+- PostgreSQL：pg_dump
+- ES：快照仓库
 
 安全：
-- DSN 使用环境变量 / secrets 管理
-- 内部 LLM 接口限制内网访问 + 日志脱敏（避免敏感 payload）
+- DSN 环境变量 / secrets
+- 内部 LLM 接口仅内网
+- 日志避免敏感数据
 
 容量规划：
-- version_ranges 行数 ≈ (平均产品数 * 漏洞数)，占位控制在可接受比例
-- 索引 mapping 含 nested; 若数据增长大，可考虑分片数调整（当前默认 1）
+- version_ranges 行数 ≈ (平均产品数 * 漏洞数)
+- nested 字段量大时关注 ES shard & 内存
 
 ---
 ## 10. 未来可扩展点
-1. 增量策略：基于新文件时间戳或外部队列；或加入 ingestion_time 列。
-2. 质量评估：对比 LLM 输出与规则提取结果自动回归验证。
-3. 风险级别统一：引入专门 risk_score 数值模型。
-4. API 服务：FastAPI 封装搜索、统计、导出。
-5. 监控：Prometheus + Grafana（处理量 / 失败数 / LLM 耗时）。
-6. 重试策略：已实现单任务多次重试（无多轮）；可新增失败任务持久化队列实现延迟重试。
-7. 产品名归一：基于别名字典或 embeddings 归一化 product_id；占位可作为人工标注起点。
-8. 视图性能：改物化视图 + 定时 refresh。
-9. 安全审核：对外部输出做脱敏处理（若涉及 POC）。
-10. 国际化支持：多语言风险描述分字段。
+1. FORCE_FULL 模式：按需恢复全量重建。
+2. 自动质量回归：抽样比对旧/新 extractor_ver 差异。
+3. 产品名归一化：别名字典或 embedding 聚类。
+4. 指标监控：Prometheus + Grafana。
+5. 失败任务延迟重试队列。
+6. 多语言描述拆分字段。
+7. 物化视图 + 增量 refresh。
+8. 更细粒度版本正则 / 语言适配。
+9. ES pipeline 预处理 (ingest)。
+10. Web 管理界面（任务 / 指标 / 重跑）。
 
 ---
 (完)

@@ -17,7 +17,7 @@
 - 常见问题
 
 ## 背景与目标
-全量（按需）或定时：爬取 (CVE / CNVD / CNNVD) 最新数据 → 写入 PostgreSQL → 调用 LLM 抽取受影响产品版本范围 → 同步至 Elasticsearch。新增单个源文件可通过 API 增量快速导入；历史补齐/再抽取走全量脚本。模式为追加，不做更新/删除。
+全量（按需）或定时：爬取 (CVE / CNVD / CNNVD) 最新数据 → 写入 PostgreSQL → 调用 LLM 抽取受影响产品版本范围 → 同步至 Elasticsearch。新增单个源文件可通过 API 增量快速导入；历史缺失的版本区间自动“补齐”。当前默认策略：仅对“尚无任何版本区间记录”的 es_id 进行抽取（skip-existing），避免重复重写；必要时可手动清空某些 es_id 的版本记录以强制重新抽取。模式为追加（不删除原始漏洞记录），仅对同一 es_id 的版本区间可能覆盖（当你手动删除后再补齐）。
 
 ## 系统架构
 ```
@@ -34,7 +34,7 @@ FastAPI (keyword / 条件搜索) 直接查 ES
 |------|------|
 | db.py | 统一连接 + 初始化 schema/view |
 | CNNVD/, CNVD/, CVE/ | 各数据源 parser + ingest 脚本 |
-| llm_version_ranges.py | 统一遍历方式调用 LLM 提取版本区间（run_all_exhaustive + only_es_ids 增量） |
+| llm_version_ranges.py | 统一遍历方式调用 LLM 提取版本区间（run_all_exhaustive：默认补齐缺失，支持指定 only_es_ids 增量） |
 | pipeline_daily.py | 全量流程：爬取→入库→单次遍历 LLM→全量 ES 同步 |
 | search_db.py / search_es.py | 关键字 / 产品+版本 搜索 |
 | PROJECT_MANUAL.md | 更完整的设计/维护手册 |
@@ -133,7 +133,7 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 | LLM_RETRY_BACKOFF_BASE | 1.5 | 重试指数退避基数 (sleep = base^(attempt-1) 上限10s) |
 | ENABLE_FALLBACK | true | LLM 失败/空结果后启用启发式回退抽取 |
 | INSERT_PLACEHOLDER_ON_EMPTY | true | 最终仍无结果时写入占位 (product_id=placeholder, 0.0.0) 保证有记录 |
-| EXTRACTOR_VER | 1 | 版本抽取器版本号（用于跳过已处理数据） |
+| EXTRACTOR_VER | 1 | 版本抽取器标签（当前默认“补齐缺失”不会因为版本号变化自动重跑；作为结果标记，用于统计 / 将来手动重抽） |
 | LLM_THREADS | 4 | pipeline 兼容参数（实际并发由 MAX_WORKERS/LLM_CONCURRENCY 控制） |
 | INTRA_BATCH_LOG_EVERY | 100 | 单批内处理多少条输出一次进度日志 |
 | HEARTBEAT_SEC | 30 | 单批内若超过该秒数无完成则输出心跳进度 |
@@ -144,17 +144,17 @@ docker run -d -p 8000:8000 --name vuln pluto-vulnsearch:offline
 全量（pipeline_daily / main 无文件参数）：
 1. ensure_schema
 2. ingest 三源（幂等追加）
-3. run_all_exhaustive 一次性遍历所有未达到当前 EXTRACTOR_VER 的 es_id（不再多轮）
-4. 汇总视图全部文档 → ES bulk upsert
+3. run_all_exhaustive 补齐：仅抽取“还没有任何 vuln_version_range 记录”的 es_id（跳过已有）
+4. 汇总视图全部文档 → ES bulk upsert（已有版本区间的文档也会照常进 ES）
 5. 输出 summary JSON
 
 增量（/upload mode=incremental）：
-1. 解析上传文件并入库（新 es_id）
-2. run_all_exhaustive(only_es_ids=[...])：仅遍历该集合直到处理完（跳过已存在 >=EXTRACTOR_VER 的）
+1. 解析上传文件并入库（新增 / 更新 es_id）
+2. run_all_exhaustive(only_es_ids=[...])：同样“只补缺”，若这些 es_id 已经存在版本区间则立即跳过（不重复 LLM 调用）
 3. 仅同步这些 es_id 到 ES（bulk）
 4. 返回统计
 
-mode=full 仍执行全量 run_all_exhaustive。
+若需要“强制重新抽取”某些 es_id，可先删除其在 vuln_version_range 中的记录（或临时写脚本），再运行即可重新进入候选。未来可增加环境变量（例如 FORCE_FULL=1）触发一次性全量重构（当前未实现）。
 
 失败与健壮性：
 - LLM：重试 → 回退 → 占位。
@@ -162,17 +162,26 @@ mode=full 仍执行全量 run_all_exhaustive。
 - 全量 summary 标记 partial 若存在失败。
 
 ## LLM 版本范围抽取
-统一遍历模式：
-1. 每批（BATCH）查询未达当前 EXTRACTOR_VER 的 es_id；若指定 only_es_ids 则限定集合。
+统一遍历模式（当前默认“补齐缺失”）：
+1. 每批（BATCH）查询缺少版本区间的 es_id（或限定 only_es_ids 后再过滤缺失）；已有记录的 es_id 不进入任务队列。
 2. 批次内线程池 (MAX_WORKERS) 并发 worker；LLM 调用再受 LLM_CONCURRENCY 信号量节流。
 3. 每条：LLM 调用 → 重试 (LLM_RETRIES, 指数退避) → 回退启发式 (ENABLE_FALLBACK) → 占位 (INSERT_PLACEHOLDER_ON_EMPTY)。
   - 回退：LLM 失败/空时用正则粗提版本生成低置信度 eq items（尽量给出真实但可能噪声的版本）。
-  - 占位：仍无结果则写一行 placeholder(0.0.0)，仅为保持结构完整，后续版本升级会覆盖。
-4. 写入：先 DELETE 旧记录，再 UPSERT 新区间；占位将被后续更高 EXTRACTOR_VER 覆盖。
+  - 占位：仍无结果则写一行 placeholder(0.0.0)，保持结构。以后若手动清理记录再跑会重新尝试。
+4. 写入：只针对“缺失” es_id 插入（不先删旧，因为既然缺失就没有旧行）。
 5. 日志：
-  - 批次开始/结束统计 (processed / failed / empty / skipped / placeholders / fallback / rows)。
-  - 批次内每 INTRA_BATCH_LOG_EVERY 条日志进度；若超 HEARTBEAT_SEC 未有完成输出心跳。
-6. 统计字段（最终汇总）：total_tasks, processed, skipped, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec。
+  - 批次开始/结束统计 (processed / failed / empty / skipped_existing / placeholders / fallback / rows)。
+  - 批次内每 INTRA_BATCH_LOG_EVERY 条日志进度；如超 HEARTBEAT_SEC 输出心跳。
+6. 统计字段（最终汇总）：total_tasks, processed, skipped_existing, empty, failed, inserted_products, inserted_rows, fallback_used, placeholders, retry_total, batches, elapsed_sec。
+
+### 回退 (fallback) 与 占位 (placeholder) 说明
+| 类型 | 触发条件 | 内容 | 常见原因 |
+|------|----------|------|----------|
+| 正常 | LLM 成功返回含版本 items | 直接解析 | 文本含明确版本号 |
+| 回退 | LLM 多次异常 / 超时 / 空结果 且 ENABLE_FALLBACK=true | 正则提取到的版本等价 eq / wildcard | 简单版本格式、LLM 未解析、接口故障 |
+| 占位 | LLM 与回退都无任何版本 且 INSERT_PLACEHOLDER_ON_EMPTY=true | product_id=placeholder, 0.0.0 | 原始文本无版本号（如 “php php” / 纯产品名列表） |
+
+示例：字段为 "php php" 时没有真实版本，过去会因尝试解析纯字母 token 触发 `invalid literal for int() with base 10: 'php'`。现已在回退阶段过滤纯字母短 token，避免该异常；若仍无版本 → 写占位。
 
 ## 手动常用操作
 单独运行 LLM 抽取:
@@ -213,7 +222,7 @@ Q: LLM 超时 / 429？
 A: 已内置重试 + 指数退避，可调 LLM_RETRIES / LLM_RETRY_BACKOFF_BASE；必要时降低 LLM_CONCURRENCY 或提升 REQUEST_TIMEOUT。
 
 Q: 为什么会出现 placeholder 记录？
-A: 当 LLM 抽取与回退均无结果且 INSERT_PLACEHOLDER_ON_EMPTY=true，为保持数据完整性写入占位；升级 EXTRACTOR_VER 后统一重新抽取覆盖。
+A: 当 LLM 抽取与回退均无结果且 INSERT_PLACEHOLDER_ON_EMPTY=true，为保持数据完整性写入占位；任一后续运行都会再次尝试并覆盖。 
 
 Q: 如何新增新的漏洞源？
 A: 新增表 + parser + ingest_xxx.py；更新 ensure_schema & merged_vulnerabilities_view；ES 读取视图即可。

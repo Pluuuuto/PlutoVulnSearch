@@ -5,9 +5,9 @@ FROM python:3.10-slim
 # 环境变量（可根据实际需要调整）
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PG_DSN="host=pg01 port=5432 dbname=test user=test password=test" \
+    PG_DSN="host=pg01 port=5432 dbname=vul user=test password=test" \
     ES_URL="http://es01:9200" \
-    ES_INDEX="test_vulnerabilities"
+    ES_INDEX="vulnerabilities"
 
 # 工作目录
 WORKDIR /app

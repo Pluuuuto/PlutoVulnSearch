@@ -67,6 +67,7 @@ LLM_THREADS = int(os.getenv('LLM_THREADS', '4'))  # placeholder (actual concurre
 ES_SKIP_IF_EMPTY = os.getenv('ES_SKIP_IF_EMPTY', 'true').lower() in ('1','true','yes','y')
 TRAVERSE_BATCH = int(os.getenv('TRAVERSE_BATCH', os.getenv('BATCH', '1000')))  # 默认复用 LLM 脚本 BATCH
 TRAVERSE_PROGRESS_EVERY = int(os.getenv('TRAVERSE_PROGRESS_EVERY', '2000'))
+FORCE_REEXTRACT = os.getenv('FORCE_REEXTRACT', 'false').lower() in ('1','true','yes','y')
 
 def compute_coverage_stats() -> dict:
     """统计版本区间覆盖率。一次性遍历后应当 uncovered=0（若启用占位策略）。"""
@@ -285,11 +286,11 @@ def main():
         if any(v['failed'] == -1 for v in ingest_stats.values()):
             partial = True
 
-        # 一次性遍历抽取（直到耗尽）
+        # 一次性遍历抽取（仅补齐缺失，已存在跳过）
         traverse_stats = run_all_exhaustive(batch=TRAVERSE_BATCH, progress_every=TRAVERSE_PROGRESS_EVERY)
         if traverse_stats.get('failed', 0) > 0:
             partial = True
-        vr_stats = {'mode': 'traverse_all', 'stats': traverse_stats}
+        vr_stats = {'mode': 'skip_existing', 'stats': traverse_stats}
 
         # 遍历后直接统计覆盖（单次，无 before/after 对比）
         coverage_after = compute_coverage_stats()
