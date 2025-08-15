@@ -166,6 +166,8 @@ mode=full 仍执行全量 run_all_exhaustive。
 1. 每批（BATCH）查询未达当前 EXTRACTOR_VER 的 es_id；若指定 only_es_ids 则限定集合。
 2. 批次内线程池 (MAX_WORKERS) 并发 worker；LLM 调用再受 LLM_CONCURRENCY 信号量节流。
 3. 每条：LLM 调用 → 重试 (LLM_RETRIES, 指数退避) → 回退启发式 (ENABLE_FALLBACK) → 占位 (INSERT_PLACEHOLDER_ON_EMPTY)。
+  - 回退：LLM 失败/空时用正则粗提版本生成低置信度 eq items（尽量给出真实但可能噪声的版本）。
+  - 占位：仍无结果则写一行 placeholder(0.0.0)，仅为保持结构完整，后续版本升级会覆盖。
 4. 写入：先 DELETE 旧记录，再 UPSERT 新区间；占位将被后续更高 EXTRACTOR_VER 覆盖。
 5. 日志：
   - 批次开始/结束统计 (processed / failed / empty / skipped / placeholders / fallback / rows)。

@@ -19,7 +19,7 @@
     - [4.3 llm\_version\_ranges.py](#43-llm_version_rangespy)
     - [4.4 pipeline\_daily.py](#44-pipeline_dailypy)
     - [4.5 search\_es.py / search\_db.py](#45-search_espy--search_dbpy)
-  - [5. 日常自动化流程 (pipeline\_daily)](#5-日常自动化流程-pipeline_daily)
+  - [5. 全量 vs 增量流程](#5-全量-vs-增量流程)
   - [6. LLM 版本区间抽取设计（统一遍历）](#6-llm-版本区间抽取设计统一遍历)
   - [7. Elasticsearch 索引与搜索](#7-elasticsearch-索引与搜索)
   - [8. 代码规范与约定](#8-代码规范与约定)
@@ -198,6 +198,8 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 6. 区间合并：`items_to_intervals()` 解析为离散区间 + 可读 `version_text`。
 7. 写入：删除旧 es_id → UPSERT 每个区间；含 `extractor_ver` 以支持后续升级。
 
+简化记忆：回退=“粗糙猜测一些真实版本”（低置信度避免空白）；占位=“放一块砖保证有结构”，两者都在下次版本升级时被覆盖。
+
 占位意义：保证下游 ES 文档嵌套结构存在 version_ranges 数组元素，便于统计“覆盖率”；未来提升 `EXTRACTOR_VER` 后会被覆盖。
 
 统计指标：
@@ -236,6 +238,16 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 ---
 ## 9. 运维与部署建议
 调度：Windows 任务计划程序 / cron（Linux）。
+
+db_config.ini 约定（统一）：
+```
+[postgresql]
+host=127.0.0.1
+port=5432
+dbname=YOUR_DB   # 必须使用 dbname 关键字；不再支持 database 别名
+user=xxx
+password=xxx
+```
 
 关键环境变量（补充）：
 - 重试相关：LLM_RETRIES, LLM_RETRY_BACKOFF_BASE

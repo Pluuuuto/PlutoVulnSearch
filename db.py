@@ -176,6 +176,8 @@ def get_conn() -> PGConnection:
         cfg = configparser.ConfigParser()
         cfg.read('db_config.ini')
         d = cfg['postgresql']
+        if 'dbname' not in d:
+            raise RuntimeError("db_config.ini 需使用键 'dbname' 指定数据库名称 (已取消对 'database' 的兼容)")
         _GLOBAL_CONN = psycopg2.connect(**d)
     else:
         _GLOBAL_CONN = psycopg2.connect(PG_DSN)

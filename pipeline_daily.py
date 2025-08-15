@@ -1,30 +1,35 @@
-"""每日漏洞数据流水线（增强版）。
+"""每日漏洞数据流水线（统一遍历模式）。
 
 流程：
-    1. 确保数据库 schema 存在。
-    2. 采集三源数据（CVE / CNVD / CNNVD，幂等插入）。
-    3. 多轮 LLM 版本区间抽取（直到无新增或达到最大轮次）。
-    4. 全量（幂等 upsert）同步到 Elasticsearch 索引。
-    5. 输出汇总统计 JSON（含多轮细节）。
+    1. ensure_schema 创建/确认表与视图。
+    2. 三源 ingest 幂等追加写入 (CVE / CNVD / CNNVD)。
+    3. 单次遍历 LLM 版本区间抽取 (run_all_exhaustive) 直到所有未达当前 EXTRACTOR_VER 的 es_id 处理完。
+    4. 聚合视图+版本区间，批量 upsert 到 Elasticsearch。
+    5. 输出汇总 JSON（含遍历统计 + 覆盖率 + ES 成功/失败）。
 
-核心环境变量：
-    PG_DSN                 PostgreSQL 连接（可回退 db_config.ini）
-    ES_URL                 Elasticsearch 地址 (默认 http://localhost:9200)
-    ES_INDEX               索引名 (默认 vulnerabilities)
-    LLM_THREADS            兼容占位（实际并发由 llm_version_ranges 控制）
-    VR_MAX_LOOPS           LLM 抽取最大循环轮次 (默认 5)
-    VR_STOP_ON_ZERO        某轮 processed=0 时提前停止 (默认 true)
-    ES_SKIP_IF_EMPTY       没有文档时跳过 ES 同步 (默认 true)
+核心环境变量（精简后）：
+    PG_DSN                 PostgreSQL 连接（或使用 db_config.ini）
+    ES_URL / ES_INDEX      Elasticsearch 目标
+    BATCH                  每次抓取任务批大小
+    MAX_WORKERS            worker 线程数
+    LLM_CONCURRENCY        实际 LLM 并发（信号量）
+    LLM_RETRIES / LLM_RETRY_BACKOFF_BASE 重试与退避
+    ENABLE_FALLBACK        失败/空结果启用启发式回退
+    INSERT_PLACEHOLDER_ON_EMPTY 仍无结果时写占位
+    EXTRACTOR_VER          抽取器版本（升级触发重跑）
+    INTRA_BATCH_LOG_EVERY  批内进度日志频率
+    HEARTBEAT_SEC          批内心跳日志间隔
+    ES_SKIP_IF_EMPTY       无文档时跳过 ES 同步
 
 幂等性：
-    - 数据采集：ON CONFLICT DO NOTHING 追加。
-    - LLM 抽取：仅处理当前 extractor_ver 未覆盖的 es_id，多轮迅速收敛。
-    - ES 同步：按 _id 覆盖（upsert）。
+    - ingest 追加：ON CONFLICT DO NOTHING。
+    - LLM：同一 es_id + extractor_ver 仅处理一次；提升 EXTRACTOR_VER 触发重跑覆盖旧行。
+    - ES：bulk index 以 _id 覆盖。
 
 退出码：
-    0 成功
-    1 部分成功（存在 ingest 失败或 ES 部分失败等非致命问题）
-    2 致命失败（未捕获异常）
+    0 success
+    1 partial（某些步骤非致命失败）
+    2 fatal（未捕获异常）
 """
 from __future__ import annotations
 

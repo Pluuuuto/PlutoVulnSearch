@@ -387,12 +387,28 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
 
             used_fallback = False
             used_placeholder = False
+            # 过滤掉 items 为空或无法生成区间的产品（避免产生“processed 但不写行”）
+            if products:
+                filtered = []
+                for p in products:
+                    its = p.get('items') or []
+                    if items_to_intervals(its):
+                        filtered.append(p)
+                if not filtered:
+                    # 全部 products 没有有效区间，等同于空
+                    products = []
             if ENABLE_FALLBACK and (llm_error or not products):
                 fb = fallback_extract(text)
                 if fb:
                     logger.info(f"启用回退抽取 es_id={es_id} products={len(fb)} (llm_error={bool(llm_error)})")
                     products = fb
                     used_fallback = True
+                    # 再次过滤 fallback 结果
+                    filtered = []
+                    for p in products:
+                        if items_to_intervals(p.get('items') or []):
+                            filtered.append(p)
+                    products = filtered
 
             if not products and INSERT_PLACEHOLDER_ON_EMPTY:
                 products = [{
@@ -407,15 +423,20 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
                 try:
                     rows_written = upsert_ranges(conn, es_id, text, products)
                     conn.commit()
-                    return {
-                        "es_id": es_id,
-                        "inserted": True,
-                        "count": len(products),
-                        "interval_rows": rows_written,
-                        "fallback": used_fallback,
-                        "placeholder": used_placeholder,
-                        "retries": attempts-1
-                    }
+                    if rows_written > 0:
+                        return {
+                            "es_id": es_id,
+                            "inserted": True,
+                            "count": len(products),
+                            "interval_rows": rows_written,
+                            "fallback": used_fallback,
+                            "placeholder": used_placeholder,
+                            "retries": attempts-1
+                        }
+                    else:
+                        # 没有任何区间写入，视为空
+                        logger.debug(f"es_id={es_id} 未产生有效区间 (rows_written=0)，标记 empty")
+                        return {"es_id": es_id, "empty": True, "retries": attempts-1, "fallback": used_fallback, "placeholder": used_placeholder}
                 except Exception as we:
                     if conn:
                         try:
@@ -424,7 +445,7 @@ def worker(task: Dict[str, str], pool: pg_pool.SimpleConnectionPool) -> Dict[str
                             pass
                     logger.error(f"写入失败 es_id={es_id}: {we}")
                     return {"es_id": es_id, "error": str(we), "retries": attempts-1}
-            return {"es_id": es_id, "empty": True, "retries": attempts-1}
+            return {"es_id": es_id, "empty": True, "retries": attempts-1, "fallback": used_fallback, "placeholder": used_placeholder}
         except Exception as e:
             if conn:
                 try:
@@ -465,6 +486,12 @@ def run_all_exhaustive(batch: int | None = None, progress_every: int = 1000, onl
     batches = 0
     start = time.time()
     try:
+        # 启动时打印一次连接目标（不含密码）便于排查连接错库
+        try:
+            dsn_show = psycopg2.connect(dsn).get_dsn_parameters()
+            logger.info(f"[TRAVERSE] 连接数据库 host={dsn_show.get('host')} dbname={dsn_show.get('dbname')} user={dsn_show.get('user')}")
+        except Exception as _ie:
+            logger.warning(f"[TRAVERSE] 连接参数获取失败: {_ie}")
         while True:
             # 拉一批未覆盖 extractor_ver 的
             conn = pool.getconn()
@@ -550,7 +577,28 @@ def run_all_exhaustive(batch: int | None = None, progress_every: int = 1000, onl
             )
             if processed and processed % progress_every == 0:
                 logger.info(f"[TRAVERSE] 累计 processed={processed} inserted_rows={inserted_rows} failed={failed} placeholders={placeholders}")
+        # ========== 结束后做一次完整性 / 差异诊断 ==========
         elapsed = time.time() - start
+        integrity = {}
+        try:
+            conn_chk = psycopg2.connect(dsn)
+            with conn_chk.cursor() as cur:
+                cur.execute("SELECT COUNT(*), COUNT(DISTINCT es_id) FROM vuln_version_range WHERE extractor_ver=%s", (EXTRACTOR_VER,))
+                row = cur.fetchone()
+                cur.execute("SELECT COUNT(DISTINCT es_id) FROM vuln_version_range")
+                all_es = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM vuln_version_range")
+                total_rows_now = cur.fetchone()[0]
+                integrity = {
+                    'rows_current_extractor_ver': row[0],
+                    'es_ids_current_extractor_ver': row[1],
+                    'es_ids_all_versions': all_es,
+                    'rows_all_versions': total_rows_now
+                }
+            conn_chk.close()
+        except Exception as ie:
+            logger.warning(f"[TRAVERSE] 完成后完整性检查失败: {ie}")
+
         stats = {
             'mode': 'traverse_all',
             'total_tasks': total_tasks,
@@ -564,8 +612,18 @@ def run_all_exhaustive(batch: int | None = None, progress_every: int = 1000, onl
             'placeholders': placeholders,
             'retry_total': retry_total,
             'batches': batches,
-            'elapsed_sec': round(elapsed, 3)
+            'elapsed_sec': round(elapsed, 3),
+            'integrity': integrity
         }
+        # 诊断提示：如果统计的 inserted_rows 与 integrity['rows_current_extractor_ver'] 不一致，给出原因线索
+        try:
+            if integrity and inserted_rows != integrity.get('rows_current_extractor_ver'):
+                logger.warning(
+                    "[TRAVERSE][DIFF] inserted_rows(统计)=%s 与 实际当前版本行数=%s 不一致：可能原因=1) 多线程重复 attempt 统计重复 2) 任务产生相同区间触发 ON CONFLICT 更新 3) items_to_intervals 合并使多 item 收敛为 1 行 4) 日志读取的是 processed(任务数) 误认为行数",
+                    inserted_rows, integrity.get('rows_current_extractor_ver')
+                )
+        except Exception:
+            pass
         logger.info(f"[TRAVERSE] 完成 {stats}")
         return stats
     finally:
