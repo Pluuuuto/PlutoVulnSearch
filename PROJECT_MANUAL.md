@@ -72,6 +72,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ### 3.2 表 cnvd
 | 字段 | 类型 | 说明 |
+|------|------|------|
 | cnvd_number | TEXT UNIQUE | CNVD 编号 |
 | title | TEXT | 标题 |
 | severity | TEXT | 严重性（高/中/低）|
@@ -90,6 +91,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ### 3.3 表 cnnvd
 | 字段 | 类型 | 说明 |
+|------|------|------|
 | vuln_id | TEXT UNIQUE | CNNVD 编号 |
 | name | TEXT | 漏洞名称 |
 | published | DATE | 发布时间 |
@@ -105,6 +107,7 @@ LLM 抽取 (llm_version_ranges) ──> vuln_version_range (版本区间规范�
 
 ### 3.4 表 vuln_version_range
 | 字段 | 类型 | 说明 |
+|------|------|------|
 | es_id | TEXT | 对应融合视图主键 |
 | product_id | TEXT | 规范化产品名（小写）|
 | min_code | BIGINT | 版本编码下界 |
